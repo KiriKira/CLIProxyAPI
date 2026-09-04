@@ -139,6 +139,12 @@ type XAIConfig struct {
 
 // AntigravityConfig configures provider-wide Antigravity request behavior.
 type AntigravityConfig struct {
+	// UseACP toggles using the official local ACP daemon rather than legacy REST endpoints.
+	UseACP bool `yaml:"use-acp,omitempty" json:"use-acp,omitempty"`
+	// BinaryPath is the path to the agy_acp_server executable.
+	BinaryPath string `yaml:"binary-path,omitempty" json:"binary-path,omitempty"`
+	// GeminiHome is the custom profile directory for the ACP daemon.
+	GeminiHome string `yaml:"gemini-home,omitempty" json:"gemini-home,omitempty"`
 	// SensitiveWords is a list of words to obfuscate with zero-width characters in system instructions.
 	SensitiveWords []string `yaml:"sensitive-words,omitempty" json:"sensitive-words,omitempty"`
 }
