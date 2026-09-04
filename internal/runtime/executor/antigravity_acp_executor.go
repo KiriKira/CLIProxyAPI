@@ -3,9 +3,13 @@ package executor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -58,51 +62,307 @@ func (e *AntigravityAcpExecutor) CountTokens(ctx context.Context, auth *cliproxy
 	}, nil
 }
 
-func (e *AntigravityAcpExecutor) getBinaryConfig(auth *cliproxyauth.Auth) (command string, args []string, geminiHome string, apiKey string) {
-	command = "agy_acp_server.par"
-	if auth != nil && auth.Attributes != nil {
-		if cmd := auth.Attributes["binary_path"]; cmd != "" {
-			command = cmd
-		}
-		if home := auth.Attributes["gemini_home"]; home != "" {
-			geminiHome = home
-		}
-		if key := auth.Attributes["api_key"]; key != "" {
-			apiKey = key
-		}
-	}
-	if geminiHome == "" {
-		geminiHome = os.Getenv("GEMINI_HOME")
-		if geminiHome == "" {
-			geminiHome = os.TempDir()
-		}
-	}
-	args = []string{"--uid="}
-	return
+// Supported ACP authenticate method ids, mirroring the official agent's
+// initialize advertisement.
+const (
+	acpAuthOAuthPersonal = "oauth-personal"
+	acpAuthOAuthBusiness = "oauth-business"
+	acpAuthGeminiAPIKey  = "gemini-api-key"
+	acpAuthAgentPlatform = "agent-platform"
+)
+
+// acpAuthConfig is the resolved credential selection for one request. It
+// never carries token material: API keys stay in the spawned environment,
+// OAuth tokens stay in the agent profile directory.
+type acpAuthConfig struct {
+	method      string
+	apiKey      string
+	gcpProject  string
+	gcpLocation string
 }
 
-func (e *AntigravityAcpExecutor) buildClient(auth *cliproxyauth.Auth) (*acp.Client, error) {
-	cmd, args, geminiHome, apiKey := e.getBinaryConfig(auth)
+func (e *AntigravityAcpExecutor) attr(auth *cliproxyauth.Auth, key string) string {
+	if auth == nil || auth.Attributes == nil {
+		return ""
+	}
+	return strings.TrimSpace(auth.Attributes[key])
+}
+
+// resolveAuthMethod picks the ACP authenticate method id.
+func (e *AntigravityAcpExecutor) resolveAuthMethod(auth *cliproxyauth.Auth) string {
+	if m := e.attr(auth, "auth_method"); m != "" {
+		return m
+	}
+	if e.cfg != nil && strings.TrimSpace(e.cfg.Antigravity.AuthMethod) != "" {
+		return strings.TrimSpace(e.cfg.Antigravity.AuthMethod)
+	}
+	return acpAuthOAuthPersonal
+}
+
+// resolveAuthConfig validates the credential selection for the method,
+// mirroring the T3 provider's config-issue checks so misconfiguration fails
+// fast with an actionable message instead of an opaque agent error.
+func (e *AntigravityAcpExecutor) resolveAuthConfig(auth *cliproxyauth.Auth) (*acpAuthConfig, error) {
+	method := e.resolveAuthMethod(auth)
+	switch method {
+	case acpAuthOAuthPersonal, acpAuthOAuthBusiness, acpAuthGeminiAPIKey, acpAuthAgentPlatform:
+	default:
+		return nil, statusErr{code: http.StatusBadRequest, msg: fmt.Sprintf("unknown Antigravity ACP auth method %q (want oauth-personal, oauth-business, gemini-api-key or agent-platform)", method)}
+	}
+	cfg := &acpAuthConfig{method: method}
+	cfg.apiKey = e.attr(auth, "api_key")
+	cfg.gcpProject = e.attr(auth, "gcp_project")
+	cfg.gcpLocation = e.attr(auth, "gcp_location")
+	if e.cfg != nil {
+		if cfg.gcpProject == "" {
+			cfg.gcpProject = strings.TrimSpace(e.cfg.Antigravity.GcpProject)
+		}
+		if cfg.gcpLocation == "" {
+			cfg.gcpLocation = strings.TrimSpace(e.cfg.Antigravity.GcpLocation)
+		}
+	}
+	switch method {
+	case acpAuthGeminiAPIKey:
+		if cfg.apiKey == "" {
+			cfg.apiKey = strings.TrimSpace(os.Getenv("GEMINI_API_KEY"))
+		}
+		if cfg.apiKey == "" {
+			return nil, statusErr{code: http.StatusUnauthorized, msg: "Antigravity ACP gemini-api-key method needs an api_key auth attribute or GEMINI_API_KEY"}
+		}
+	case acpAuthOAuthBusiness:
+		if cfg.gcpProject == "" || cfg.gcpLocation == "" {
+			return nil, statusErr{code: http.StatusUnauthorized, msg: "Antigravity ACP oauth-business needs a GCP project and location (gcp_project/gcp_location)"}
+		}
+	case acpAuthAgentPlatform:
+		if cfg.apiKey == "" {
+			cfg.apiKey = strings.TrimSpace(os.Getenv("GOOGLE_API_KEY"))
+		}
+		if cfg.apiKey == "" && (cfg.gcpProject == "" || cfg.gcpLocation == "") {
+			return nil, statusErr{code: http.StatusUnauthorized, msg: "Antigravity ACP agent-platform needs an api_key or a GCP project and location"}
+		}
+	}
+	return cfg, nil
+}
+
+// resolveBinary locates the official ACP server executable. Explicit paths
+// must exist; bare names fall back to PATH lookup.
+func (e *AntigravityAcpExecutor) resolveBinary(auth *cliproxyauth.Auth) (string, error) {
+	candidates := []string{e.attr(auth, "binary_path")}
+	if e.cfg != nil {
+		candidates = append(candidates, strings.TrimSpace(e.cfg.Antigravity.BinaryPath))
+	}
+	candidates = append(candidates, strings.TrimSpace(os.Getenv("AGY_ACP_BINARY")))
+	for _, c := range candidates {
+		if c == "" {
+			continue
+		}
+		if strings.Contains(c, string(os.PathSeparator)) {
+			if st, err := os.Stat(c); err != nil || st.IsDir() {
+				continue
+			}
+			return c, nil
+		}
+		if p, err := exec.LookPath(c); err == nil {
+			return p, nil
+		}
+	}
+	for _, name := range []string{"agy_acp_server.par", "agy_acp_server"} {
+		if p, err := exec.LookPath(name); err == nil {
+			return p, nil
+		}
+	}
+	return "", statusErr{code: http.StatusBadGateway, msg: "Antigravity ACP binary not found (set antigravity.binary-path, binary_path auth attribute or AGY_ACP_BINARY)"}
+}
+
+// resolveHarness returns the harness executable shipped alongside the agent
+// binary, or "" when absent. The agent still starts without it.
+func resolveHarness(binary string) string {
+	dir := filepath.Dir(binary)
+	for _, name := range []string{"localharness_external", "localharness_external.exe"} {
+		p := filepath.Join(dir, name)
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			return p
+		}
+	}
+	return ""
+}
+
+// sanitizeProfileName keeps an auth ID safe as a single path segment.
+func sanitizeProfileName(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '-', r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	if b.Len() == 0 {
+		return "default"
+	}
+	return b.String()
+}
+
+// resolveProfileDir returns the GEMINI_HOME for this credential. An explicit
+// gemini_home (auth attribute, config, or environment) is honored verbatim
+// so owners of an existing Antigravity login keep using it; otherwise a
+// per-auth isolated directory persists the agent token across requests.
+func (e *AntigravityAcpExecutor) resolveProfileDir(auth *cliproxyauth.Auth) string {
+	if home := e.attr(auth, "gemini_home"); home != "" {
+		return home
+	}
+	if e.cfg != nil && strings.TrimSpace(e.cfg.Antigravity.GeminiHome) != "" {
+		return strings.TrimSpace(e.cfg.Antigravity.GeminiHome)
+	}
+	if env := strings.TrimSpace(os.Getenv("GEMINI_HOME")); env != "" {
+		return env
+	}
+	base, err := os.UserHomeDir()
+	if err != nil || base == "" {
+		return filepath.Join(os.TempDir(), "cli-proxy-api-antigravity-acp")
+	}
+	name := "default"
+	if auth != nil && strings.TrimSpace(auth.ID) != "" {
+		name = sanitizeProfileName(auth.ID)
+	}
+	return filepath.Join(base, ".cli-proxy-api", "antigravity-acp", name)
+}
+
+// writeProfileSettings rewrites the agent profile settings on every launch
+// so method/project/location edits take effect immediately. It never stores
+// credentials; the agent owns its token file after sign-in.
+func writeProfileSettings(geminiHome string, cfg *acpAuthConfig) error {
+	acpDir := filepath.Join(geminiHome, "antigravity-acp")
+	if err := os.MkdirAll(acpDir, 0o700); err != nil {
+		return fmt.Errorf("create ACP profile dir: %w", err)
+	}
+	settings := map[string]any{"auth": map[string]any{"type": cfg.method}}
+	if cfg.gcpProject != "" || cfg.gcpLocation != "" {
+		gcp := map[string]any{}
+		if cfg.gcpProject != "" {
+			gcp["project"] = cfg.gcpProject
+		}
+		if cfg.gcpLocation != "" {
+			gcp["location"] = cfg.gcpLocation
+		}
+		settings["gcp"] = gcp
+	}
+	raw, err := json.Marshal(settings)
+	if err != nil {
+		return fmt.Errorf("marshal ACP profile settings: %w", err)
+	}
+	raw = append(raw, '\n')
+	if err := os.WriteFile(filepath.Join(acpDir, "settings.json"), raw, 0o600); err != nil {
+		return fmt.Errorf("write ACP profile settings: %w", err)
+	}
+	return nil
+}
+
+// acpAuthenticateTimeout bounds the authenticate step. It is the only ACP
+// call allowed a timeout: it runs during credential acquisition, and a fresh
+// profile makes the agent print a plain-text auth URL on stdout and block on
+// a browser login that can never complete headless. Without the bound the
+// request would hang until the caller's context expires. Overridable in tests.
+var acpAuthenticateTimeout = 60 * time.Second
+
+// spawnClient launches the agent with a method-scoped environment and runs
+// initialize plus authenticate. The caller owns Close.
+func (e *AntigravityAcpExecutor) spawnClient(ctx context.Context, auth *cliproxyauth.Auth) (*acp.Client, error) {
+	ac, err := e.resolveAuthConfig(auth)
+	if err != nil {
+		return nil, err
+	}
+	binary, err := e.resolveBinary(auth)
+	if err != nil {
+		return nil, err
+	}
+	profileDir := e.resolveProfileDir(auth)
+	if err := writeProfileSettings(profileDir, ac); err != nil {
+		return nil, statusErr{code: http.StatusBadGateway, msg: err.Error()}
+	}
 
 	env := []string{
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + os.Getenv("HOME"),
-		"GEMINI_HOME=" + geminiHome,
+		"GEMINI_HOME=" + profileDir,
 		"AGY_ACP_FORCE_FILE_STORAGE=1",
 		"BROWSER=/bin/true",
 		"PYTHONUNBUFFERED=1",
 		"ELECTRON_RUN_AS_NODE=1",
 	}
-	if apiKey != "" {
-		env = append(env, "GEMINI_API_KEY="+apiKey)
+	// Only the selected method's credential reaches the agent.
+	switch ac.method {
+	case acpAuthGeminiAPIKey:
+		env = append(env, "GEMINI_API_KEY="+ac.apiKey)
+	case acpAuthAgentPlatform:
+		if ac.apiKey != "" {
+			env = append(env, "GOOGLE_API_KEY="+ac.apiKey)
+		}
+	}
+	if harness := resolveHarness(binary); harness != "" {
+		env = append(env, "ANTIGRAVITY_HARNESS_PATH="+harness)
 	}
 
-	cfg := acp.SpawnConfig{
-		Command: cmd,
-		Args:    args,
+	client, err := acp.NewClient(acp.SpawnConfig{
+		Command: binary,
+		Args:    acpUIDArgs(),
 		Env:     env,
+	})
+	if err != nil {
+		return nil, statusErr{code: http.StatusBadGateway, msg: fmt.Sprintf("failed to spawn ACP agent: %v", err)}
 	}
-	return acp.NewClient(cfg)
+	if _, err := client.Initialize(ctx, "CLIProxyAPI", "1.0.0"); err != nil {
+		client.Close()
+		return nil, statusErr{code: http.StatusBadGateway, msg: fmt.Sprintf("ACP initialize failed: %v", err)}
+	}
+	authCtx, cancelAuth := context.WithTimeout(ctx, acpAuthenticateTimeout)
+	defer cancelAuth()
+	if err := client.Authenticate(authCtx, ac.method); err != nil {
+		client.Close()
+		if ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
+			return nil, statusErr{code: http.StatusUnauthorized, msg: "Antigravity sign-in required: complete the Google login for this profile, then retry"}
+		}
+		return nil, e.mapAuthError(ac, err)
+	}
+	return client, nil
+}
+
+// acpUIDArgs mirrors the official launch contract: --uid= on linux.
+func acpUIDArgs() []string {
+	if runtime.GOOS == "linux" {
+		return []string{"--uid="}
+	}
+	return nil
+}
+
+// mapAuthError turns agent authentication refusals into actionable 401s.
+func (e *AntigravityAcpExecutor) mapAuthError(ac *acpAuthConfig, err error) error {
+	if acp.IsSignInRequired(err) {
+		switch ac.method {
+		case acpAuthOAuthPersonal, acpAuthOAuthBusiness:
+			return statusErr{code: http.StatusUnauthorized, msg: "Antigravity sign-in required: complete the Google login for this profile, then retry"}
+		default:
+			return statusErr{code: http.StatusUnauthorized, msg: fmt.Sprintf("Antigravity %s credential rejected: %v", ac.method, err)}
+		}
+	}
+	return statusErr{code: http.StatusBadGateway, msg: fmt.Sprintf("ACP authenticate failed: %v", err)}
+}
+
+// openSession creates one isolated session and applies the requested model.
+func openSession(ctx context.Context, client *acp.Client, model string) (string, error) {
+	cwd, _ := os.Getwd()
+	sessionID, err := client.NewSession(ctx, cwd)
+	if err != nil {
+		if acp.IsSignInRequired(err) {
+			return "", statusErr{code: http.StatusUnauthorized, msg: "Antigravity sign-in required: complete the Google login for this profile, then retry"}
+		}
+		return "", statusErr{code: http.StatusBadGateway, msg: fmt.Sprintf("ACP session/new failed: %v", err)}
+	}
+	if baseModel := thinking.ParseSuffix(model).ModelName; baseModel != "" {
+		_, _ = client.SetConfigOption(ctx, sessionID, "model", baseModel)
+	}
+	return sessionID, nil
 }
 
 // extractPromptBlocks converts raw OpenAI/Claude JSON payload to an ACP PromptBlock slice.
@@ -153,25 +413,15 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 		return resp, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
 	}
 
-	client, err := e.buildClient(auth)
+	client, err := e.spawnClient(ctx, auth)
 	if err != nil {
-		return resp, statusErr{code: http.StatusBadGateway, msg: fmt.Sprintf("failed to spawn ACP agent: %v", err)}
+		return resp, err
 	}
 	defer client.Close()
 
-	if _, err := client.Initialize(ctx, "CLIProxyAPI", "1.0.0"); err != nil {
-		return resp, statusErr{code: http.StatusBadGateway, msg: fmt.Sprintf("ACP initialize failed: %v", err)}
-	}
-
-	cwd, _ := os.Getwd()
-	sessionID, err := client.NewSession(ctx, cwd)
+	sessionID, err := openSession(ctx, client, req.Model)
 	if err != nil {
-		return resp, statusErr{code: http.StatusBadGateway, msg: fmt.Sprintf("ACP session/new failed: %v", err)}
-	}
-
-	baseModel := thinking.ParseSuffix(req.Model).ModelName
-	if baseModel != "" {
-		_, _ = client.SetConfigOption(ctx, sessionID, "model", baseModel)
+		return resp, err
 	}
 
 	var responseText strings.Builder
@@ -253,26 +503,15 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 		return nil, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
 	}
 
-	client, err := e.buildClient(auth)
+	client, err := e.spawnClient(ctx, auth)
 	if err != nil {
-		return nil, statusErr{code: http.StatusBadGateway, msg: fmt.Sprintf("failed to spawn ACP agent: %v", err)}
+		return nil, err
 	}
 
-	if _, err := client.Initialize(ctx, "CLIProxyAPI", "1.0.0"); err != nil {
-		client.Close()
-		return nil, statusErr{code: http.StatusBadGateway, msg: fmt.Sprintf("ACP initialize failed: %v", err)}
-	}
-
-	cwd, _ := os.Getwd()
-	sessionID, err := client.NewSession(ctx, cwd)
+	sessionID, err := openSession(ctx, client, req.Model)
 	if err != nil {
 		client.Close()
-		return nil, statusErr{code: http.StatusBadGateway, msg: fmt.Sprintf("ACP session/new failed: %v", err)}
-	}
-
-	baseModel := thinking.ParseSuffix(req.Model).ModelName
-	if baseModel != "" {
-		_, _ = client.SetConfigOption(ctx, sessionID, "model", baseModel)
+		return nil, err
 	}
 
 	chunkChan := make(chan cliproxyexecutor.StreamChunk, 128)

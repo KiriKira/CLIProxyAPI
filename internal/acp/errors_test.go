@@ -5,11 +5,30 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestIsSignInRequired(t *testing.T) {
+	if !IsSignInRequired(&RPCError{Code: -32000, Message: "Authentication required"}) {
+		t.Fatal("expected -32000 to count as sign-in required")
+	}
+	if !IsSignInRequired(fmt.Errorf("agent call: %w", &RPCError{Code: -32000, Message: "nope"})) {
+		t.Fatal("expected wrapped -32000 to count as sign-in required")
+	}
+	if IsSignInRequired(&RPCError{Code: -32601, Message: "not found"}) {
+		t.Fatal("other RPC codes must not count as sign-in required")
+	}
+	if IsSignInRequired(transportErrorf("agent stdout closed")) {
+		t.Fatal("transport errors must not count as sign-in required")
+	}
+	if IsSignInRequired(nil) {
+		t.Fatal("nil must not count as sign-in required")
+	}
+}
 
 func TestErrorTypesAreDistinct(t *testing.T) {
 	rpcErr := &RPCError{Code: -32601, Message: "nope"}

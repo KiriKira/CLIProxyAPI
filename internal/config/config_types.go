@@ -147,6 +147,13 @@ type AntigravityConfig struct {
 	GeminiHome string `yaml:"gemini-home,omitempty" json:"gemini-home,omitempty"`
 	// SensitiveWords is a list of words to obfuscate with zero-width characters in system instructions.
 	SensitiveWords []string `yaml:"sensitive-words,omitempty" json:"sensitive-words,omitempty"`
+	// AuthMethod is the ACP authenticate method id: oauth-personal,
+	// oauth-business, gemini-api-key or agent-platform. Empty means oauth-personal.
+	AuthMethod string `yaml:"auth-method,omitempty" json:"auth-method,omitempty"`
+	// GcpProject/GcpLocation feed oauth-business and agent-platform via
+	// the agent profile settings. Never hold credentials.
+	GcpProject  string `yaml:"gcp-project,omitempty" json:"gcp-project,omitempty"`
+	GcpLocation string `yaml:"gcp-location,omitempty" json:"gcp-location,omitempty"`
 }
 
 // CodexConfig configures provider-wide Codex request behavior.

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,40 +19,79 @@ func createFakeAgentScript(t *testing.T) string {
 	dir := t.TempDir()
 	scriptPath := filepath.Join(dir, "fake_agent.sh")
 
-	// Create a minimal fake ACP agent script in bash
-	script := `#!/usr/bin/env bash
-while IFS= read -r line; do
-  if [[ "$line" == *"\"method\":\"initialize\""* ]]; then
-    echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"capabilities":{},"agentInfo":{"name":"fake-agent","version":"1.0.0"}}}'
-  elif [[ "$line" == *"\"method\":\"session/new\""* ]]; then
-    echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"sess-123","configOptions":[{"id":"model","type":"select","options":[{"value":"gemini-3.8-flash"}]}]}}'
-  elif [[ "$line" == *"\"method\":\"session/set_config_option\""* ]]; then
-    echo '{"jsonrpc":"2.0","id":3,"result":{}}'
-  elif [[ "$line" == *"\"method\":\"session/prompt\""* ]]; then
-    # Emit thought update
-    echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-123","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"thinking step"}}}}'
-    # Emit message update
-    echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-123","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hello from acp"}}}}'
-    # Emit prompt response
-    echo '{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}'
-  fi
-done
-`
+	// Minimal fake ACP agent in bash. It echoes the request id back so the
+	// client matches replies regardless of call sequencing, and logs every
+	// session-level method to methods.log for handshake-order assertions.
+	script := "#!/usr/bin/env bash\n" +
+		"LOG_DIR=\"$(dirname \"$0\")\"\n" +
+		"while IFS= read -r line; do\n" +
+		"  id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p')\n" +
+		"  [ -z \"$id\" ] && id=1\n" +
+		"  if [[ \"$line\" == *'\"method\":\"initialize\"'* ]]; then\n" +
+		"    echo initialize >> \"$LOG_DIR/methods.log\"\n" +
+		"    echo '{\"jsonrpc\":\"2.0\",\"id\":'$id',\"result\":{\"protocolVersion\":1,\"capabilities\":{},\"agentInfo\":{\"name\":\"fake-agent\",\"version\":\"1.0.0\"}}}'\n" +
+		"  elif [[ \"$line\" == *'\"method\":\"authenticate\"'* ]]; then\n" +
+		"    echo authenticate >> \"$LOG_DIR/methods.log\"\n" +
+		"    echo '{\"jsonrpc\":\"2.0\",\"id\":'$id',\"result\":{}}'\n" +
+		"  elif [[ \"$line\" == *'\"method\":\"session/new\"'* ]]; then\n" +
+		"    echo session/new >> \"$LOG_DIR/methods.log\"\n" +
+		"    echo '{\"jsonrpc\":\"2.0\",\"id\":'$id',\"result\":{\"sessionId\":\"sess-123\",\"configOptions\":[{\"id\":\"model\",\"type\":\"select\",\"options\":[{\"value\":\"gemini-3.8-flash\"}]}]}}'\n" +
+		"  elif [[ \"$line\" == *'\"method\":\"session/set_config_option\"'* ]]; then\n" +
+		"    echo '{\"jsonrpc\":\"2.0\",\"id\":'$id',\"result\":{}}'\n" +
+		"  elif [[ \"$line\" == *'\"method\":\"session/prompt\"'* ]]; then\n" +
+		"    echo session/prompt >> \"$LOG_DIR/methods.log\"\n" +
+		"    echo '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"sess-123\",\"update\":{\"sessionUpdate\":\"agent_thought_chunk\",\"content\":{\"type\":\"text\",\"text\":\"thinking step\"}}}}'\n" +
+		"    echo '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"sess-123\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"hello from acp\"}}}}'\n" +
+		"    echo '{\"jsonrpc\":\"2.0\",\"id\":'$id',\"result\":{\"stopReason\":\"end_turn\"}}'\n" +
+		"  fi\n" +
+		"done\n"
 	if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
 		t.Fatalf("failed to write fake agent script: %v", err)
 	}
+
 	return scriptPath
+}
+
+// methodsSeen returns the method names the fake agent observed, in order.
+func methodsSeen(t *testing.T, script string) []string {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(filepath.Dir(script), "methods.log"))
+	if err != nil {
+		t.Fatalf("read methods log: %v", err)
+	}
+	var out []string
+	for _, m := range strings.Split(string(raw), "\n") {
+		if m != "" {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+func assertHandshakeOrder(t *testing.T, script string) {
+	t.Helper()
+	got := methodsSeen(t, script)
+	want := []string{"initialize", "authenticate", "session/new", "session/prompt"}
+	if len(got) != len(want) {
+		t.Fatalf("methods = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("methods = %v, want %v", got, want)
+		}
+	}
 }
 
 func TestAntigravityAcpExecutorExecute(t *testing.T) {
 	script := createFakeAgentScript(t)
+	geminiHome := t.TempDir()
 	cfg := &internalconfig.Config{}
 	exec := NewAntigravityAcpExecutor(cfg)
 
 	auth := &cliproxyauth.Auth{
 		Attributes: map[string]string{
 			"binary_path": script,
-			"gemini_home": t.TempDir(),
+			"gemini_home": geminiHome,
 		},
 	}
 
@@ -61,7 +101,7 @@ func TestAntigravityAcpExecutorExecute(t *testing.T) {
 	}
 	opts := cliproxyexecutor.Options{}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	resp, err := exec.Execute(ctx, auth, req, opts)
@@ -100,6 +140,25 @@ func TestAntigravityAcpExecutorExecute(t *testing.T) {
 	if data.Choices[0].FinishReason != "end_turn" {
 		t.Errorf("finish_reason = %q, want 'end_turn'", data.Choices[0].FinishReason)
 	}
+
+	assertHandshakeOrder(t, script)
+
+	// Profile settings must pin the default auth method without credentials.
+	raw, err := os.ReadFile(filepath.Join(geminiHome, "antigravity-acp", "settings.json"))
+	if err != nil {
+		t.Fatalf("read profile settings: %v", err)
+	}
+	var settings struct {
+		Auth struct {
+			Type string `json:"type"`
+		} `json:"auth"`
+	}
+	if err := json.Unmarshal(raw, &settings); err != nil {
+		t.Fatalf("unmarshal profile settings: %v", err)
+	}
+	if settings.Auth.Type != "oauth-personal" {
+		t.Errorf("settings auth.type = %q, want oauth-personal", settings.Auth.Type)
+	}
 }
 
 func TestAntigravityAcpExecutorExecuteStream(t *testing.T) {
@@ -120,7 +179,7 @@ func TestAntigravityAcpExecutorExecuteStream(t *testing.T) {
 	}
 	opts := cliproxyexecutor.Options{}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	stream, err := exec.ExecuteStream(ctx, auth, req, opts)
@@ -176,5 +235,125 @@ func TestAntigravityAcpExecutorExecuteStream(t *testing.T) {
 	}
 	if !hasDone {
 		t.Errorf("missing [DONE] terminal chunk in stream")
+	}
+
+	assertHandshakeOrder(t, script)
+}
+
+func TestAntigravityAcpExecutorRejectsUnknownAuthMethod(t *testing.T) {
+	script := createFakeAgentScript(t)
+	exec := NewAntigravityAcpExecutor(&internalconfig.Config{})
+	auth := &cliproxyauth.Auth{
+		Attributes: map[string]string{
+			"binary_path": script,
+			"gemini_home": t.TempDir(),
+			"auth_method": "bogus",
+		},
+	}
+	req := cliproxyexecutor.Request{
+		Model:   "gemini-3.8-flash",
+		Payload: []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := exec.Execute(ctx, auth, req, cliproxyexecutor.Options{}); err == nil || !strings.Contains(err.Error(), "unknown Antigravity ACP auth method") {
+		t.Fatalf("expected unknown-method error, got %v", err)
+	}
+}
+
+func TestAntigravityAcpExecutorGeminiAPIKeyNeedsKey(t *testing.T) {
+	t.Setenv("GEMINI_API_KEY", "")
+	script := createFakeAgentScript(t)
+	exec := NewAntigravityAcpExecutor(&internalconfig.Config{})
+	auth := &cliproxyauth.Auth{
+		Attributes: map[string]string{
+			"binary_path": script,
+			"gemini_home": t.TempDir(),
+			"auth_method": "gemini-api-key",
+		},
+	}
+	req := cliproxyexecutor.Request{
+		Model:   "gemini-3.8-flash",
+		Payload: []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := exec.Execute(ctx, auth, req, cliproxyexecutor.Options{}); err == nil || !strings.Contains(err.Error(), "needs an api_key") {
+		t.Fatalf("expected missing-key error, got %v", err)
+	}
+}
+
+func TestAntigravityAcpExecutorMissingBinary(t *testing.T) {
+	t.Setenv("AGY_ACP_BINARY", "")
+	exec := NewAntigravityAcpExecutor(&internalconfig.Config{})
+	auth := &cliproxyauth.Auth{
+		Attributes: map[string]string{
+			"binary_path": filepath.Join(t.TempDir(), "no-such-agent.par"),
+			"gemini_home": t.TempDir(),
+		},
+	}
+	req := cliproxyexecutor.Request{
+		Model:   "gemini-3.8-flash",
+		Payload: []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := exec.Execute(ctx, auth, req, cliproxyexecutor.Options{}); err == nil || !strings.Contains(err.Error(), "binary not found") {
+		t.Fatalf("expected binary-missing error, got %v", err)
+	}
+}
+
+func TestSanitizeProfileName(t *testing.T) {
+	if got := sanitizeProfileName("user@example.com"); got != "user_example.com" {
+		t.Errorf("got %q", got)
+	}
+	if got := sanitizeProfileName(""); got != "default" {
+		t.Errorf("got %q", got)
+	}
+}
+
+// TestAntigravityAcpExecutorHangingAuthenticateFailsFast covers a fresh
+// profile: the real agent prints a plain-text auth URL and blocks instead of
+// answering authenticate, so the bounded step must surface 401 instead of
+// hanging until the caller's context expires.
+func TestAntigravityAcpExecutorHangingAuthenticateFailsFast(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := filepath.Join(dir, "hanging_agent.sh")
+	script := "#!/usr/bin/env bash\n" +
+		"while IFS= read -r line; do\n" +
+		"  id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p')\n" +
+		"  [ -z \"$id\" ] && id=1\n" +
+		"  if [[ \"$line\" == *'\"method\":\"initialize\"'* ]]; then\n" +
+		"    echo '{\"jsonrpc\":\"2.0\",\"id\":'$id',\"result\":{\"protocolVersion\":1,\"capabilities\":{},\"agentInfo\":{\"name\":\"hanging\",\"version\":\"1.0.0\"}}}'\n" +
+		"  fi\n" +
+		"done\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
+		t.Fatalf("write hanging agent script: %v", err)
+	}
+
+	oldTimeout := acpAuthenticateTimeout
+	acpAuthenticateTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { acpAuthenticateTimeout = oldTimeout })
+
+	exec := NewAntigravityAcpExecutor(&internalconfig.Config{})
+	auth := &cliproxyauth.Auth{
+		Attributes: map[string]string{
+			"binary_path": scriptPath,
+			"gemini_home": t.TempDir(),
+		},
+	}
+	req := cliproxyexecutor.Request{
+		Model:   "gemini-3.8-flash",
+		Payload: []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	start := time.Now()
+	_, err := exec.Execute(ctx, auth, req, cliproxyexecutor.Options{})
+	if err == nil || !strings.Contains(err.Error(), "sign-in required") {
+		t.Fatalf("expected sign-in-required error, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 8*time.Second {
+		t.Fatalf("authenticate hang took %v, want a fast 401", elapsed)
 	}
 }
