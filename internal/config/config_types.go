@@ -139,14 +139,10 @@ type XAIConfig struct {
 
 // AntigravityConfig configures provider-wide Antigravity request behavior.
 type AntigravityConfig struct {
-	// UseACP toggles using the official local ACP daemon rather than legacy REST endpoints.
-	UseACP bool `yaml:"use-acp,omitempty" json:"use-acp,omitempty"`
 	// BinaryPath is the path to the agy_acp_server executable.
 	BinaryPath string `yaml:"binary-path,omitempty" json:"binary-path,omitempty"`
 	// GeminiHome is the custom profile directory for the ACP daemon.
 	GeminiHome string `yaml:"gemini-home,omitempty" json:"gemini-home,omitempty"`
-	// SensitiveWords is a list of words to obfuscate with zero-width characters in system instructions.
-	SensitiveWords []string `yaml:"sensitive-words,omitempty" json:"sensitive-words,omitempty"`
 	// AuthMethod is the ACP authenticate method id: oauth-personal,
 	// oauth-business, gemini-api-key or agent-platform. Empty means oauth-personal.
 	AuthMethod string `yaml:"auth-method,omitempty" json:"auth-method,omitempty"`
@@ -237,11 +233,6 @@ type QuotaExceeded struct {
 
 	// SwitchPreviewModel indicates whether to automatically switch to a preview model when a quota is exceeded.
 	SwitchPreviewModel bool `yaml:"switch-preview-model" json:"switch-preview-model"`
-
-	// AntigravityCredits enables credits-based last-resort fallback for Claude models.
-	// When all free-tier auths are exhausted (429/503), the conductor retries with
-	// an auth that has available Google One AI credits.
-	AntigravityCredits bool `yaml:"antigravity-credits" json:"antigravity-credits"`
 }
 
 // RoutingConfig configures how credentials are selected for requests.

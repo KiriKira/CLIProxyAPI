@@ -110,7 +110,6 @@ func purgeExpiredCaches() {
 	})
 	purgeExpiredCodexReasoningReplayCache(now)
 	purgeExpiredXAIReasoningReplayCache(now)
-	purgeExpiredAntigravityReasoningReplayCache(now)
 	purgeExpiredKimiThinkingReplayCache(now)
 	purgeExpiredClaudeThinkingReplayCache(now)
 }

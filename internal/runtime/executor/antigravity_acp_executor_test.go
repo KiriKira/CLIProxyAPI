@@ -15,6 +15,7 @@ import (
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 )
 
 func createFakeAgentScript(t *testing.T) string {
@@ -590,5 +591,136 @@ func TestAntigravityAcpExecutorHangingAuthenticateFailsFast(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 8*time.Second {
 		t.Fatalf("authenticate hang took %v, want a fast 401", elapsed)
+	}
+}
+
+func TestAntigravityAcpExecutorExecuteResponsesFormat(t *testing.T) {
+	script := createFakeAgentScript(t)
+	exec := NewAntigravityAcpExecutor(&internalconfig.Config{})
+	auth := &cliproxyauth.Auth{
+		Attributes: map[string]string{
+			"binary_path": script,
+			"gemini_home": t.TempDir(),
+		},
+	}
+	req := cliproxyexecutor.Request{
+		Model:   "gemini-3.8-flash",
+		Payload: []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+	}
+	opts := cliproxyexecutor.Options{ResponseFormat: sdktranslator.FormatOpenAIResponse}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	resp, err := exec.Execute(ctx, auth, req, opts)
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	var data struct {
+		Object string `json:"object"`
+		Output []struct {
+			Type    string `json:"type"`
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"output"`
+	}
+	if err := json.Unmarshal(resp.Payload, &data); err != nil {
+		t.Fatalf("unmarshal responses payload: %v\n%s", err, resp.Payload)
+	}
+	if data.Object != "response" {
+		t.Errorf("object = %q, want response", data.Object)
+	}
+	found := false
+	for _, item := range data.Output {
+		for _, c := range item.Content {
+			if c.Text == "hello from acp" {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Errorf("responses output missing model text: %s", resp.Payload)
+	}
+}
+
+func TestAntigravityAcpExecutorStreamResponsesFormat(t *testing.T) {
+	script := createFakeAgentScript(t)
+	exec := NewAntigravityAcpExecutor(&internalconfig.Config{})
+	auth := &cliproxyauth.Auth{
+		Attributes: map[string]string{
+			"binary_path": script,
+			"gemini_home": t.TempDir(),
+		},
+	}
+	req := cliproxyexecutor.Request{
+		Model:   "gemini-3.8-flash",
+		Payload: []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+	}
+	opts := cliproxyexecutor.Options{ResponseFormat: sdktranslator.FormatOpenAIResponse}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	stream, err := exec.ExecuteStream(ctx, auth, req, opts)
+	if err != nil {
+		t.Fatalf("ExecuteStream failed: %v", err)
+	}
+	var joined strings.Builder
+	for chunk := range stream.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error: %v", chunk.Err)
+		}
+		joined.Write(chunk.Payload)
+	}
+	out := joined.String()
+	if !strings.Contains(out, "response.output_text.delta") {
+		t.Errorf("missing output_text deltas in responses stream:\n%s", out)
+	}
+	if !strings.Contains(out, "response.completed") {
+		t.Errorf("missing response.completed terminal event:\n%s", out)
+	}
+	if strings.Contains(out, `"choices"`) {
+		t.Errorf("chat-style chunk leaked into responses stream:\n%s", out)
+	}
+}
+
+func TestBuildPromptBlocksGeminiContents(t *testing.T) {
+	payload := `{"contents":[
+		{"role":"user","parts":[
+			{"text":"see image"},
+			{"inlineData":{"mimeType":"image/png","data":"` + acpTestPixelPNG + `"}},
+			{"inlineData":{"mimeType":"application/pdf","data":"JVBERi0xLjQgZmFrZQ=="}}
+		]},
+		{"role":"model","parts":[{"text":"noted"}]}
+	]}`
+	blocks, cleanup, err := buildPromptBlocks([]byte(payload))
+	defer cleanup()
+	if err != nil {
+		t.Fatalf("buildPromptBlocks: %v", err)
+	}
+	if len(blocks) != 3 {
+		t.Fatalf("got %d blocks, want 3: %+v", len(blocks), blocks)
+	}
+	if blocks[0].Type != "text" || !strings.Contains(blocks[0].Text, "[USER]: see image") || !strings.Contains(blocks[0].Text, "[ASSISTANT]: noted") {
+		t.Errorf("text block = %+v", blocks[0])
+	}
+	if blocks[1].Type != "image" || blocks[1].MimeType != "image/png" {
+		t.Errorf("image block = %+v", blocks[1])
+	}
+	if blocks[2].Type != "resource_link" || blocks[2].MimeType != "application/pdf" {
+		t.Errorf("pdf block = %+v", blocks[2])
+	}
+}
+
+func TestBuildPromptBlocksClaudeImage(t *testing.T) {
+	payload := `{"messages":[{"role":"user","content":[
+		{"type":"text","text":"what"},
+		{"type":"image","source":{"type":"base64","media_type":"image/png","data":"` + acpTestPixelPNG + `"}}
+	]}]}`
+	blocks, cleanup, err := buildPromptBlocks([]byte(payload))
+	defer cleanup()
+	if err != nil {
+		t.Fatalf("buildPromptBlocks: %v", err)
+	}
+	if len(blocks) != 2 || blocks[0].Type != "text" || blocks[1].Type != "image" {
+		t.Fatalf("unexpected blocks: %+v", blocks)
 	}
 }

@@ -351,8 +351,8 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 		MaxRetryCredentials:           1,
 		MaxRetryInterval:              1,
 		WebsocketAuth:                 false,
-		QuotaExceeded:                 config.QuotaExceeded{SwitchProject: false, SwitchPreviewModel: false, AntigravityCredits: false},
-		Antigravity:                   config.AntigravityConfig{SensitiveWords: []string{"old-word"}},
+		QuotaExceeded:                 config.QuotaExceeded{SwitchProject: false, SwitchPreviewModel: false},
+		Antigravity:                   config.AntigravityConfig{AuthMethod: "oauth-personal"},
 		ClaudeKey:                     []config.ClaudeKey{{APIKey: "c1"}},
 		CodexKey:                      []config.CodexKey{{APIKey: "x1"}},
 		RemoteManagement:              config.RemoteManagement{DisableControlPanel: false, PanelGitHubRepository: "old/repo", SecretKey: "keep"},
@@ -377,8 +377,8 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 		MaxRetryCredentials:           3,
 		MaxRetryInterval:              3,
 		WebsocketAuth:                 true,
-		QuotaExceeded:                 config.QuotaExceeded{SwitchProject: true, SwitchPreviewModel: true, AntigravityCredits: true},
-		Antigravity:                   config.AntigravityConfig{SensitiveWords: []string{"new-word-1", "new-word-2"}},
+		QuotaExceeded:                 config.QuotaExceeded{SwitchProject: true, SwitchPreviewModel: true},
+		Antigravity:                   config.AntigravityConfig{AuthMethod: "oauth-business"},
 		XAI:                           config.XAIConfig{InjectXSearch: true},
 		ClaudeKey: []config.ClaudeKey{
 			{APIKey: "c1", BaseURL: "http://new", ProxyURL: "http://p", Headers: map[string]string{"H": "1"}, ExcludedModels: []string{"a"}},
@@ -426,8 +426,6 @@ func TestBuildConfigChangeDetails_FlagsAndKeys(t *testing.T) {
 	expectContains(t, details, "nonstream-keepalive-interval: 0 -> 5")
 	expectContains(t, details, "quota-exceeded.switch-project: false -> true")
 	expectContains(t, details, "quota-exceeded.switch-preview-model: false -> true")
-	expectContains(t, details, "quota-exceeded.antigravity-credits: false -> true")
-	expectContains(t, details, "antigravity.sensitive-words: 1 -> 2")
 	expectContains(t, details, "xai.inject-x-search: false -> true")
 	expectContains(t, details, "api-keys count: 1 -> 2")
 	expectContains(t, details, "claude-api-key count: 1 -> 2")
@@ -452,7 +450,7 @@ func TestBuildConfigChangeDetails_AllBranches(t *testing.T) {
 		MaxRetryCredentials:           1,
 		MaxRetryInterval:              1,
 		WebsocketAuth:                 false,
-		QuotaExceeded:                 config.QuotaExceeded{SwitchProject: false, SwitchPreviewModel: false, AntigravityCredits: false},
+		QuotaExceeded:                 config.QuotaExceeded{SwitchProject: false, SwitchPreviewModel: false},
 		GeminiKey: []config.GeminiKey{
 			{APIKey: "g-old", BaseURL: "http://g-old", ProxyURL: "http://gp-old", Headers: map[string]string{"A": "1"}},
 		},
@@ -501,7 +499,7 @@ func TestBuildConfigChangeDetails_AllBranches(t *testing.T) {
 		MaxRetryCredentials:           3,
 		MaxRetryInterval:              3,
 		WebsocketAuth:                 true,
-		QuotaExceeded:                 config.QuotaExceeded{SwitchProject: true, SwitchPreviewModel: true, AntigravityCredits: true},
+		QuotaExceeded:                 config.QuotaExceeded{SwitchProject: true, SwitchPreviewModel: true},
 		GeminiKey: []config.GeminiKey{
 			{APIKey: "g-new", BaseURL: "http://g-new", ProxyURL: "http://gp-new", Headers: map[string]string{"A": "2"}, ExcludedModels: []string{"x", "y"}},
 		},
@@ -561,7 +559,6 @@ func TestBuildConfigChangeDetails_AllBranches(t *testing.T) {
 	expectContains(t, changes, "ws-auth: false -> true")
 	expectContains(t, changes, "quota-exceeded.switch-project: false -> true")
 	expectContains(t, changes, "quota-exceeded.switch-preview-model: false -> true")
-	expectContains(t, changes, "quota-exceeded.antigravity-credits: false -> true")
 	expectContains(t, changes, "api-keys: values updated (count unchanged, redacted)")
 	expectContains(t, changes, "gemini[0].base-url: http://g-old -> http://g-new")
 	expectContains(t, changes, "gemini[0].proxy-url: http://gp-old -> http://gp-new")

@@ -561,7 +561,6 @@ func TestTranslateRequestWithCodexMultiAgentV2Conditions(t *testing.T) {
 	}{
 		{name: "Claude", to: sdktranslator.FormatClaude, path: "messages.0.content", want: "task", model: "claude-sonnet-4-5"},
 		{name: "Gemini", to: sdktranslator.FormatGemini, path: "contents.0.parts.0.text", want: "task", model: "gemini-2.5-pro"},
-		{name: "Antigravity", to: sdktranslator.FormatAntigravity, path: "request.contents.0.parts.0.text", want: "task", model: "gemini-2.5-pro"},
 		{name: "OpenAI", to: sdktranslator.FormatOpenAI, path: "messages.0.content.0.text", want: "task", model: "chat-model"},
 		{name: "Interactions", to: sdktranslator.FormatInteractions, path: "input.0.content.0.text", want: "task", model: "interaction-model"},
 	}

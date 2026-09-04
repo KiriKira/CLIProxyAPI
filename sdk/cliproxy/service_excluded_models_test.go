@@ -2,8 +2,6 @@ package cliproxy
 
 import (
 	"context"
-	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -212,44 +210,12 @@ func TestRegisterModelsForAuth_OpenAICompatibilityInputModalities(t *testing.T) 
 	}
 }
 
-func TestRegisterModelsForAuth_AntigravityFetchesWebSearchCapability(t *testing.T) {
-	var sawFetch bool
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != antigravityModelsPath {
-			t.Fatalf("path = %q, want %s", r.URL.Path, antigravityModelsPath)
-		}
-		if got := r.Header.Get("Authorization"); got != "Bearer token" {
-			t.Fatalf("Authorization = %q, want bearer token", got)
-		}
-		sawFetch = true
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{
-				"models": {
-					"gemini-3.1-flash-lite": {
-						"displayName": "Gemini 3.1 Flash Lite",
-						"maxTokens": 1,
-						"maxOutputTokens": 2
-					},
-					"fetched-only-search-model": {
-						"displayName": "Fetched Only Search Model"
-					}
-				},
-				"webSearchModelIds": ["gemini-3.1-flash-lite", "fetched-only-search-model"]
-			}`))
-	}))
-	defer server.Close()
-
+func TestRegisterModelsForAuth_AntigravityStaticModels(t *testing.T) {
 	service := &Service{cfg: &config.Config{}}
 	auth := &coreauth.Auth{
-		ID:       "auth-antigravity-fetch-models",
+		ID:       "auth-antigravity-static-models",
 		Provider: "antigravity",
 		Status:   coreauth.StatusActive,
-		Attributes: map[string]string{
-			"base_url": server.URL,
-		},
-		Metadata: map[string]any{
-			"access_token": "token",
-		},
 	}
 
 	registry := internalregistry.GetGlobalRegistry()
@@ -259,9 +225,6 @@ func TestRegisterModelsForAuth_AntigravityFetchesWebSearchCapability(t *testing.
 	})
 
 	service.registerModelsForAuth(context.Background(), auth)
-	if !sawFetch {
-		t.Fatal("expected fetchAvailableModels request")
-	}
 
 	models := registry.GetModelsForClient(auth.ID)
 	staticModels := internalregistry.GetAntigravityModels()
@@ -291,8 +254,10 @@ func TestRegisterModelsForAuth_AntigravityFetchesWebSearchCapability(t *testing.
 	if webSearchModel == nil {
 		t.Fatal("expected gemini-3.1-flash-lite to be registered")
 	}
-	if !webSearchModel.SupportsWebSearch {
-		t.Fatal("expected gemini-3.1-flash-lite to support web search")
+	// Web-search capability came from fetched REST manifests; with the ACP
+	// daemon owning capabilities, static entries carry none.
+	if webSearchModel.SupportsWebSearch {
+		t.Fatal("static Antigravity entries must not claim web search")
 	}
 	staticWebSearchModel := staticByID["gemini-3.1-flash-lite"]
 	if staticWebSearchModel == nil {
@@ -303,9 +268,6 @@ func TestRegisterModelsForAuth_AntigravityFetchesWebSearchCapability(t *testing.
 	}
 	if agentModel == nil {
 		t.Fatal("expected gemini-pro-agent to be registered")
-	}
-	if agentModel.SupportsWebSearch {
-		t.Fatal("gemini-pro-agent should not support web search")
 	}
 	if staticOnlyModel == nil {
 		t.Fatal("expected static-only Antigravity model to remain registered")

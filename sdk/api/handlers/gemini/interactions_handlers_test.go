@@ -7,7 +7,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -227,76 +226,6 @@ func TestInteractionsAgentUsesNativeInteractionsEndpoint(t *testing.T) {
 	}
 	if got := gjson.GetBytes(rec.Body.Bytes(), "id").String(); got != "interaction_1" {
 		t.Fatalf("response id = %q, want interaction_1. Body: %s", got, rec.Body.String())
-	}
-}
-
-func TestInteractionsAntigravityModelUsesTranslatorBridge(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	model := "interactions-antigravity-bridge-model"
-	var upstreamBody []byte
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1internal:generateContent" {
-			http.Error(w, "unexpected path: "+r.URL.Path, http.StatusNotFound)
-			return
-		}
-		body, errRead := io.ReadAll(r.Body)
-		if errRead != nil {
-			http.Error(w, errRead.Error(), http.StatusBadRequest)
-			return
-		}
-		upstreamBody = body
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"response":{"responseId":"resp_1","candidates":[{"content":{"role":"model","parts":[{"text":"translated-ok"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":2,"totalTokenCount":3}}}`))
-	}))
-	defer server.Close()
-
-	manager := coreauth.NewManager(nil, nil, nil)
-	manager.RegisterExecutor(executor.NewAntigravityExecutor(&config.Config{RequestRetry: 1}))
-	auth := &coreauth.Auth{
-		ID:       "interactions-antigravity-bridge-auth",
-		Provider: "antigravity",
-		Status:   coreauth.StatusActive,
-		Attributes: map[string]string{
-			"base_url": server.URL,
-		},
-		Metadata: map[string]any{
-			"access_token": "token",
-			"project_id":   "project-1",
-			"expired":      time.Now().Add(time.Hour).Format(time.RFC3339),
-		},
-	}
-	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
-		t.Fatalf("manager.Register(): %v", errRegister)
-	}
-	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
-	t.Cleanup(func() {
-		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
-	})
-
-	rec := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(rec)
-	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1beta/interactions", strings.NewReader(`{"model":"`+model+`","input":"hi","generation_config":{"top_p":0.8}}`))
-	h := NewGeminiAPIHandler(handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager))
-
-	h.Interactions(ctx)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
-	}
-	if gjson.GetBytes(upstreamBody, "input").Exists() {
-		t.Fatalf("upstream body still contains raw interactions input: %s", string(upstreamBody))
-	}
-	if got := gjson.GetBytes(upstreamBody, "request.contents.0.parts.0.text").String(); got != "hi" {
-		t.Fatalf("upstream request text = %q, want hi. Body: %s", got, string(upstreamBody))
-	}
-	if got := gjson.GetBytes(upstreamBody, "request.generationConfig.topP").Float(); got != 0.8 {
-		t.Fatalf("upstream topP = %v, want 0.8. Body: %s", got, string(upstreamBody))
-	}
-	if got := gjson.GetBytes(rec.Body.Bytes(), "steps.0.content.0.text").String(); got != "translated-ok" {
-		t.Fatalf("response text = %q, want translated-ok. Body: %s", got, rec.Body.String())
-	}
-	if gjson.GetBytes(rec.Body.Bytes(), "response").Exists() {
-		t.Fatalf("response still contains raw antigravity response wrapper: %s", rec.Body.String())
 	}
 }
 

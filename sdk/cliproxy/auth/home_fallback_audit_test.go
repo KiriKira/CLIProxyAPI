@@ -2,7 +2,6 @@ package auth
 
 import (
 	"context"
-	"errors"
 	"testing"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -30,25 +29,5 @@ func TestHomeWebsocketReusesCanonicalModelSelection(t *testing.T) {
 	}
 	if got := dispatcher.calls.Load(); got != 1 {
 		t.Fatalf("Home RPOP calls = %d, want 1 for one credential and canonical model", got)
-	}
-}
-
-func TestAuditHomeCreditsFailClosed(t *testing.T) {
-	manager := NewManager(nil, nil, nil)
-	manager.SetConfig(&internalconfig.Config{Home: internalconfig.HomeConfig{Enabled: true}})
-	manager.auths["local-credits"] = &Auth{ID: "local-credits", Provider: "antigravity", Status: StatusActive}
-
-	_, _, errExecute := manager.tryAntigravityCreditsExecute(context.Background(), cliproxyexecutor.Request{Model: "claude-test"}, cliproxyexecutor.Options{})
-	assertHomeCreditsFallbackUnsupported(t, errExecute)
-
-	_, _, errStream := manager.tryAntigravityCreditsExecuteStream(context.Background(), cliproxyexecutor.Request{Model: "claude-test"}, cliproxyexecutor.Options{Stream: true})
-	assertHomeCreditsFallbackUnsupported(t, errStream)
-}
-
-func assertHomeCreditsFallbackUnsupported(t *testing.T, err error) {
-	t.Helper()
-	var authErr *Error
-	if !errors.As(err, &authErr) || authErr.Code != "home_fallback_unsupported" {
-		t.Fatalf("error = %v, want home_fallback_unsupported", err)
 	}
 }

@@ -15,18 +15,19 @@ func TestCloneForRuntimeNil(t *testing.T) {
 	}
 }
 
-func TestParseConfigBytes_AntigravitySensitiveWords(t *testing.T) {
-	cfg, errParse := ParseConfigBytes([]byte(`antigravity:
-  sensitive-words:
-    - "API"
-    - "proxy"
-`))
+func TestParseConfigBytes_AntigravityACP(t *testing.T) {
+	cfg, errParse := ParseConfigBytes([]byte("antigravity:\n  binary-path: \"/opt/agy/acp.par\"\n  auth-method: \"oauth-personal\"\n  gcp-project: \"p\"\n  gcp-location: \"l\"\n"))
 	if errParse != nil {
 		t.Fatalf("ParseConfigBytes() error = %v", errParse)
 	}
-	want := []string{"API", "proxy"}
-	if !reflect.DeepEqual(cfg.Antigravity.SensitiveWords, want) {
-		t.Fatalf("Antigravity.SensitiveWords = %#v, want %#v", cfg.Antigravity.SensitiveWords, want)
+	if cfg.Antigravity.BinaryPath != "/opt/agy/acp.par" {
+		t.Fatalf("Antigravity.BinaryPath = %q", cfg.Antigravity.BinaryPath)
+	}
+	if cfg.Antigravity.AuthMethod != "oauth-personal" {
+		t.Fatalf("Antigravity.AuthMethod = %q", cfg.Antigravity.AuthMethod)
+	}
+	if cfg.Antigravity.GcpProject != "p" || cfg.Antigravity.GcpLocation != "l" {
+		t.Fatalf("Antigravity.GCP = %#v/%#v", cfg.Antigravity.GcpProject, cfg.Antigravity.GcpLocation)
 	}
 }
 

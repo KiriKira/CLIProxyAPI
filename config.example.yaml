@@ -210,7 +210,6 @@ video-result-auth-cache-ttl: "3h"
 quota-exceeded:
   switch-project: true # Whether to automatically switch to another project when a quota is exceeded
   switch-preview-model: true # Whether to automatically switch to a preview model when a quota is exceeded
-  antigravity-credits: true # Whether to use credits as last-resort fallback when all free-tier auths are exhausted for Claude models
 
 # Routing strategy for selecting credentials when multiple match.
 routing:
@@ -295,12 +294,8 @@ codex:
     #     username: "user"
     #     credential: "secret"
 
-# Antigravity provider behavior.
+# Antigravity provider behavior (official local ACP daemon).
 # antigravity:
-#   sensitive-words:             # optional: words to obfuscate with zero-width characters in system instructions
-#     - "API"
-#     - "proxy"
-#   use-acp: false                # optional: route through the official local ACP daemon instead of legacy REST
 #   binary-path: ""               # optional: path to agy_acp_server executable (else PATH/AGY_ACP_BINARY lookup)
 #   gemini-home: ""               # optional: daemon profile dir; defaults to an isolated per-auth directory.
 #                                 # Point at an existing logged-in Gemini home to reuse its sign-in.

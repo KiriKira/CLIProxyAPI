@@ -22,9 +22,11 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/acp"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
@@ -699,6 +701,16 @@ var acpAudioFormatMIMEs = map[string]string{
 	"flac": "audio/flac", "ogg": "audio/ogg", "wav": "audio/wav", "webm": "audio/webm",
 }
 
+// decodeB64 decodes bare base64, tolerating whitespace folding.
+func decodeB64(s string) ([]byte, error) {
+	return base64.StdEncoding.DecodeString(strings.Map(func(r rune) rune {
+		if r == ' ' || r == '\n' || r == '\r' || r == '\t' {
+			return -1
+		}
+		return r
+	}, s))
+}
+
 // parseACPDataURL splits a data:<mime>;base64,... URL. Only base64 payloads
 // are accepted; remote URLs must be fetched by the caller first.
 func parseACPDataURL(raw string) (mime string, data []byte, err error) {
@@ -713,13 +725,7 @@ func parseACPDataURL(raw string) (mime string, data []byte, err error) {
 	if mime == "image/jpg" {
 		mime = "image/jpeg"
 	}
-	clean := strings.Map(func(r rune) rune {
-		if r == ' ' || r == '\n' || r == '\r' || r == '	' {
-			return -1
-		}
-		return r
-	}, b64)
-	data, err = base64.StdEncoding.DecodeString(clean)
+	data, err = decodeB64(b64)
 	if err != nil {
 		return "", nil, fmt.Errorf("invalid base64 payload: %v", err)
 	}
@@ -838,6 +844,20 @@ func (b *acpAttachmentBuilder) addFile(name, mime string, data []byte) error {
 	return nil
 }
 
+// addInlineData routes bare inline bytes (Gemini inlineData) by MIME prefix;
+// PDFs and text fall through to addFile validation, anything else is rejected.
+func (b *acpAttachmentBuilder) addInlineData(name, mime string, data []byte) error {
+	mime = strings.ToLower(strings.TrimSpace(mime))
+	switch {
+	case strings.HasPrefix(mime, "image/"):
+		return b.addImage(name, mime, data)
+	case strings.HasPrefix(mime, "audio/"):
+		return b.addAudio(name, mime, data)
+	default:
+		return b.addFile(name, mime, data)
+	}
+}
+
 // handlePart converts one OpenAI content part (chat or Responses shape) to
 // text or attachment blocks. Unknown part types are ignored so provider
 // extensions (reasoning blocks, tool calls) pass through untouched.
@@ -856,18 +876,29 @@ func (b *acpAttachmentBuilder) handlePart(part gjson.Result) error {
 			return b.fail("Image attachment: %v", err)
 		}
 		return b.addImage("image", mime, data)
+	case "image":
+		// Claude shape: {type:"image", source:{type:"base64", media_type, data}}.
+		// URL/file sources are ignored; callers must inline base64 first.
+		src := part.Get("source")
+		if src.Get("type").String() != "base64" {
+			return nil
+		}
+		mime := strings.ToLower(strings.TrimSpace(src.Get("media_type").String()))
+		if mime == "image/jpg" {
+			mime = "image/jpeg"
+		}
+		data, err := decodeB64(src.Get("data").String())
+		if err != nil {
+			return b.fail("Invalid base64 image payload: %v", err)
+		}
+		return b.addImage("image", mime, data)
 	case "input_audio":
 		format := strings.ToLower(strings.TrimSpace(part.Get("input_audio.format").String()))
 		mime, ok := acpAudioFormatMIMEs[format]
 		if !ok {
 			return b.fail("Antigravity does not support audio format '%s'. Attach a BMP, JPEG, PNG, WebP, PDF, audio, or text file.", format)
 		}
-		data, err := base64.StdEncoding.DecodeString(strings.Map(func(r rune) rune {
-			if r == ' ' || r == '\n' || r == '\r' || r == '	' {
-				return -1
-			}
-			return r
-		}, part.Get("input_audio.data").String()))
+		data, err := decodeB64(part.Get("input_audio.data").String())
 		if err != nil {
 			return b.fail("Invalid base64 audio payload: %v", err)
 		}
@@ -949,6 +980,40 @@ func buildPromptBlocks(payload []byte) (blocks []acp.PromptBlock, cleanup func()
 				if err := b.handlePart(item); err != nil {
 					cleanup()
 					return nil, cleanup, err
+				}
+			}
+		}
+	} else if contents := gjson.GetBytes(payload, "contents"); contents.Exists() && contents.IsArray() {
+		for _, turn := range contents.Array() {
+			role := turn.Get("role").String()
+			if role == "model" {
+				role = "assistant"
+			}
+			if role == "" {
+				role = "user"
+			}
+			for _, gp := range turn.Get("parts").Array() {
+				if t := gp.Get("text"); t.Exists() {
+					if s := strings.TrimSpace(t.String()); s != "" {
+						b.text.WriteString(fmt.Sprintf("[%s]: %s\n\n", strings.ToUpper(role), s))
+					}
+					continue
+				}
+				if inline := gp.Get("inlineData"); inline.Exists() {
+					data, err := decodeB64(inline.Get("data").String())
+					if err != nil {
+						cleanup()
+						return nil, cleanup, b.fail("Invalid base64 inline payload: %v", err)
+					}
+					if err := b.addInlineData("attachment", inline.Get("mimeType").String(), data); err != nil {
+						cleanup()
+						return nil, cleanup, err
+					}
+					continue
+				}
+				if fd := gp.Get("fileData"); fd.Exists() {
+					cleanup()
+					return nil, cleanup, b.fail("Gemini fileData URIs are not readable here: inline the file bytes instead")
 				}
 			}
 		}
@@ -1074,6 +1139,11 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 	if err != nil {
 		return resp, statusErr{code: http.StatusInternalServerError, msg: "failed to marshal response"}
 	}
+	if cliproxyexecutor.ResponseFormatOrSource(opts) == sdktranslator.FormatOpenAIResponse {
+		var param any
+		rawResp = sdktranslator.TranslateNonStream(ctx, sdktranslator.FormatOpenAI, sdktranslator.FormatOpenAIResponse, req.Model, opts.OriginalRequest, req.Payload, rawResp, &param)
+		rawResp = helps.EnsureResponsesUsageDetails(rawResp)
+	}
 
 	return cliproxyexecutor.Response{
 		Payload: rawResp,
@@ -1103,6 +1173,17 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 		Headers: make(http.Header),
 		Chunks:  chunkChan,
 	}
+	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
+	var streamParam any
+	emitChunk := func(payload []byte) {
+		if responseFormat != sdktranslator.FormatOpenAIResponse {
+			chunkChan <- cliproxyexecutor.StreamChunk{Payload: payload}
+			return
+		}
+		for _, c := range sdktranslator.TranslateStream(ctx, sdktranslator.FormatOpenAI, sdktranslator.FormatOpenAIResponse, req.Model, opts.OriginalRequest, req.Payload, payload, &streamParam) {
+			chunkChan <- cliproxyexecutor.StreamChunk{Payload: helps.EnsureResponsesUsageDetails(c)}
+		}
+	}
 
 	go func() {
 		defer client.Close()
@@ -1122,9 +1203,7 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 				}
 				if err := json.Unmarshal(u.Raw, &chunk); err == nil && chunk.Content.Text != "" {
 					ssePayload := fmt.Sprintf("data: {\"choices\":[{\"delta\":{\"content\":%s}}]}\n\n", string(mustMarshal(chunk.Content.Text)))
-					chunkChan <- cliproxyexecutor.StreamChunk{
-						Payload: []byte(ssePayload),
-					}
+					emitChunk([]byte(ssePayload))
 				}
 			case "agent_thought_chunk":
 				var chunk struct {
@@ -1134,9 +1213,7 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 				}
 				if err := json.Unmarshal(u.Raw, &chunk); err == nil && chunk.Content.Text != "" {
 					ssePayload := fmt.Sprintf("data: {\"choices\":[{\"delta\":{\"reasoning_content\":%s}}]}\n\n", string(mustMarshal(chunk.Content.Text)))
-					chunkChan <- cliproxyexecutor.StreamChunk{
-						Payload: []byte(ssePayload),
-					}
+					emitChunk([]byte(ssePayload))
 				}
 			}
 		})
@@ -1158,9 +1235,7 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 			return
 		}
 
-		chunkChan <- cliproxyexecutor.StreamChunk{
-			Payload: []byte("data: [DONE]\n\n"),
-		}
+		emitChunk([]byte("data: [DONE]\n\n"))
 	}()
 
 	return result, nil
