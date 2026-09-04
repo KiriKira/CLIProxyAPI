@@ -152,10 +152,17 @@ type promptRequest struct {
 	Prompt    []promptBlock `json:"prompt"`
 }
 
-// promptBlock is a single ACP content block (text/resource) in a prompt.
+// promptBlock is a single ACP content block in a prompt. Text and resource
+// blocks are inline; image/audio carry base64 payloads with a MIME type;
+// resource_link points at a staged file URI (used for PDFs, mirroring the
+// official client behavior).
 type promptBlock struct {
 	Type     string          `json:"type"`
 	Text     string          `json:"text,omitempty"`
+	Data     string          `json:"data,omitempty"`
+	MimeType string          `json:"mimeType,omitempty"`
+	URI      string          `json:"uri,omitempty"`
+	Name     string          `json:"name,omitempty"`
 	Resource json.RawMessage `json:"resource,omitempty"`
 }
 

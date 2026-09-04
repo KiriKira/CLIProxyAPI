@@ -1,7 +1,9 @@
 package executor
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/acp"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -534,8 +537,440 @@ func (e *AntigravityAcpExecutor) mapAuthError(ac *acpAuthConfig, err error) erro
 	return statusErr{code: http.StatusBadGateway, msg: fmt.Sprintf("ACP authenticate failed: %v", err)}
 }
 
-// openSession creates one isolated session and applies the requested model.
-func openSession(ctx context.Context, client *acp.Client, model string) (string, error) {
+// Antigravity encodeless reasoning effort in the model name: every Flash
+// family ships -high/-medium/-low variants and 3.1 Pro splits into
+// gemini-pro-agent (high) / gemini-3.1-pro-low. There is no separate effort
+// knob, so the proxy folds the repo-wide effort convention (model(value)
+// suffix levels plus the reasoning_effort body field) into the variant name.
+// This keeps "set model and effort independently" working end to end.
+func acpTierForLevel(level thinking.ThinkingLevel) string {
+	switch level {
+	case thinking.LevelLow, thinking.LevelMinimal:
+		return "low"
+	case thinking.LevelMedium:
+		return "medium"
+	default:
+		return "high"
+	}
+}
+
+// acpTierFromSuffix interprets a model(value) suffix as an effort tier.
+// Numeric budgets collapse to high (any positive budget) or low (zero);
+// none maps to low because the daemon offers no off switch.
+func acpTierFromSuffix(raw string) (string, bool) {
+	if level, ok := thinking.ParseLevelSuffix(raw); ok {
+		return acpTierForLevel(level), true
+	}
+	if mode, ok := thinking.ParseSpecialSuffix(raw); ok {
+		switch mode {
+		case thinking.ModeNone:
+			return "low", true
+		case thinking.ModeAuto:
+			return "medium", true
+		}
+		return "", false
+	}
+	if budget, ok := thinking.ParseNumericSuffix(raw); ok {
+		if budget <= 0 {
+			return "low", true
+		}
+		return "high", true
+	}
+	return "", false
+}
+
+// acpTierFromBody reads the reasoning_effort body field, same vocabulary as
+// the repo-wide thinking pipeline (none/minimal/low/medium/high/xhigh/max,
+// plus auto which settles on medium).
+func acpTierFromBody(payload []byte) (string, bool) {
+	v := gjson.GetBytes(payload, "reasoning_effort")
+	if !v.Exists() {
+		return "", false
+	}
+	switch strings.ToLower(strings.TrimSpace(v.String())) {
+	case "none":
+		return "low", true
+	case "minimal", "low":
+		return "low", true
+	case "medium", "auto":
+		return "medium", true
+	case "high", "xhigh", "max":
+		return "high", true
+	}
+	return "", false
+}
+
+// splitFlashVariant splits a Flash model name into family and tier. A bare
+// family (gemini-3.7-flash) matches with an empty tier; anything else is
+// left for the daemon to validate.
+func splitFlashVariant(base string) (family, tier string, ok bool) {
+	for _, t := range []string{"-high", "-medium", "-low"} {
+		if strings.HasSuffix(base, t) {
+			return strings.TrimSuffix(base, t), strings.TrimPrefix(t, "-"), true
+		}
+	}
+	if strings.HasPrefix(base, "gemini-") && strings.Contains(base, "-flash") {
+		return base, "", true
+	}
+	return "", "", false
+}
+
+func isProFamily(base string) bool {
+	switch base {
+	case "gemini-pro-agent", "gemini-3.1-pro", "gemini-3.1-pro-low", "gemini-3.1-pro-high":
+		return true
+	}
+	return false
+}
+
+// resolveAntigravityModel folds model + effort into a daemon model variant.
+// Suffix tier wins over the body field; without any effort signal an
+// explicit variant stays untouched and a bare family defaults to high,
+// matching the daemon-side default selection.
+func resolveAntigravityModel(model string, payload []byte) string {
+	suffix := thinking.ParseSuffix(model)
+	base := suffix.ModelName
+	tier := ""
+	if suffix.HasSuffix {
+		t, ok := acpTierFromSuffix(suffix.RawSuffix)
+		if !ok {
+			return base
+		}
+		tier = t
+	} else if t, ok := acpTierFromBody(payload); ok {
+		tier = t
+	}
+	if isProFamily(base) {
+		// 3.1 Pro has no medium variant; medium clamps up to the high id.
+		if tier == "low" {
+			return "gemini-3.1-pro-low"
+		}
+		return "gemini-pro-agent"
+	}
+	family, cur, ok := splitFlashVariant(base)
+	if !ok {
+		return base
+	}
+	if tier == "" {
+		tier = cur
+		if tier == "" {
+			tier = "high"
+		}
+	}
+	return family + "-" + tier
+}
+
+// Attachment limits mirror the official client: text 1 MiB, images 10 MiB,
+// audio 20 MiB, 50 MiB total per turn.
+const (
+	acpMaxImageBytes = 10 << 20
+	acpMaxAudioBytes = 20 << 20
+	acpMaxTextBytes  = 1 << 20
+	acpMaxTotalBytes = 50 << 20
+)
+
+var acpImageMIMEs = map[string]bool{
+	"image/bmp": true, "image/jpeg": true, "image/png": true, "image/webp": true,
+}
+
+var acpAudioMIMEs = map[string]bool{
+	"audio/aac": true, "audio/flac": true, "audio/mpeg": true, "audio/mp4": true,
+	"audio/m4a": true, "audio/x-m4a": true, "audio/ogg": true, "audio/wav": true,
+	"audio/x-wav": true, "audio/webm": true,
+}
+
+var acpTextMIMEs = map[string]bool{
+	"application/json": true, "application/ld+json": true, "application/javascript": true,
+	"application/typescript": true, "application/xml": true, "application/yaml": true,
+	"application/x-yaml": true, "application/x-sh": true,
+}
+
+var acpTextExtensions = map[string]bool{
+	".txt": true, ".md": true, ".markdown": true, ".json": true, ".jsonl": true,
+	".csv": true, ".tsv": true, ".log": true, ".xml": true, ".yaml": true, ".yml": true,
+	".js": true, ".ts": true, ".tsx": true, ".py": true, ".rb": true, ".go": true,
+	".rs": true, ".java": true, ".c": true, ".h": true, ".cpp": true, ".cs": true,
+	".css": true, ".html": true, ".sql": true, ".sh": true, ".toml": true, ".ini": true,
+}
+
+// acpAudioFormatMIMEs maps OpenAI input_audio formats to MIME types.
+var acpAudioFormatMIMEs = map[string]string{
+	"mp3": "audio/mpeg", "mp4": "audio/mp4", "m4a": "audio/m4a", "aac": "audio/aac",
+	"flac": "audio/flac", "ogg": "audio/ogg", "wav": "audio/wav", "webm": "audio/webm",
+}
+
+// parseACPDataURL splits a data:<mime>;base64,... URL. Only base64 payloads
+// are accepted; remote URLs must be fetched by the caller first.
+func parseACPDataURL(raw string) (mime string, data []byte, err error) {
+	if !strings.HasPrefix(raw, "data:") {
+		return "", nil, fmt.Errorf("not a data URL: send files as base64 data URLs")
+	}
+	head, b64, ok := strings.Cut(raw[len("data:"):], ",")
+	if !ok || strings.TrimSpace(b64) == "" {
+		return "", nil, fmt.Errorf("malformed data URL")
+	}
+	mime = strings.ToLower(strings.TrimSpace(strings.Split(head, ";")[0]))
+	if mime == "image/jpg" {
+		mime = "image/jpeg"
+	}
+	clean := strings.Map(func(r rune) rune {
+		if r == ' ' || r == '\n' || r == '\r' || r == '	' {
+			return -1
+		}
+		return r
+	}, b64)
+	data, err = base64.StdEncoding.DecodeString(clean)
+	if err != nil {
+		return "", nil, fmt.Errorf("invalid base64 payload: %v", err)
+	}
+	return mime, data, nil
+}
+
+// acpAttachmentBuilder accumulates text and attachment blocks for one turn,
+// staging PDFs/text files on disk so resource links stay real file URIs.
+type acpAttachmentBuilder struct {
+	text   strings.Builder
+	blocks []acp.PromptBlock
+	total  int
+	staged string
+}
+
+func (b *acpAttachmentBuilder) fail(format string, args ...any) error {
+	return statusErr{code: http.StatusBadRequest, msg: fmt.Sprintf(format, args...)}
+}
+
+func (b *acpAttachmentBuilder) charge(name string, n int) error {
+	b.total += n
+	if b.total > acpMaxTotalBytes {
+		return b.fail("Attachment '%s' is too large. Antigravity accepts text files up to 1 MiB, images up to 10 MiB, audio up to 20 MiB, and 50 MiB total attachments.", name)
+	}
+	return nil
+}
+
+func (b *acpAttachmentBuilder) stage(name string, data []byte) (string, error) {
+	if b.staged == "" {
+		dir, err := os.MkdirTemp("", "acp-attach-*")
+		if err != nil {
+			return "", b.fail("ACP attachment staging failed: %v", err)
+		}
+		b.staged = dir
+	}
+	safe := filepath.Base(name)
+	if safe == "" || safe == "." || safe == "/" {
+		safe = "attachment"
+	}
+	path := filepath.Join(b.staged, safe)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return "", b.fail("ACP attachment staging failed: %v", err)
+	}
+	return "file://" + path, nil
+}
+
+func (b *acpAttachmentBuilder) addImage(name, mime string, data []byte) error {
+	if !acpImageMIMEs[mime] {
+		return b.fail("Antigravity does not support '%s' (%s). Attach a BMP, JPEG, PNG, WebP, PDF, audio, or text file.", name, mime)
+	}
+	if len(data) > acpMaxImageBytes {
+		return b.fail("Attachment '%s' is too large. Antigravity accepts text files up to 1 MiB, images up to 10 MiB, audio up to 20 MiB, and 50 MiB total attachments.", name)
+	}
+	if err := b.charge(name, len(data)); err != nil {
+		return err
+	}
+	b.blocks = append(b.blocks, acp.PromptBlock{Type: "image", Data: base64.StdEncoding.EncodeToString(data), MimeType: mime})
+	return nil
+}
+
+func (b *acpAttachmentBuilder) addAudio(name, mime string, data []byte) error {
+	if !acpAudioMIMEs[mime] {
+		return b.fail("Antigravity does not support '%s' (%s). Attach a BMP, JPEG, PNG, WebP, PDF, audio, or text file.", name, mime)
+	}
+	if len(data) > acpMaxAudioBytes {
+		return b.fail("Attachment '%s' is too large. Antigravity accepts text files up to 1 MiB, images up to 10 MiB, audio up to 20 MiB, and 50 MiB total attachments.", name)
+	}
+	if err := b.charge(name, len(data)); err != nil {
+		return err
+	}
+	b.blocks = append(b.blocks, acp.PromptBlock{Type: "audio", Data: base64.StdEncoding.EncodeToString(data), MimeType: mime})
+	return nil
+}
+
+func (b *acpAttachmentBuilder) addFile(name, mime string, data []byte) error {
+	if mime == "application/pdf" {
+		if len(data) > acpMaxTotalBytes {
+			return b.fail("Attachment '%s' is too large. Antigravity accepts text files up to 1 MiB, images up to 10 MiB, audio up to 20 MiB, and 50 MiB total attachments.", name)
+		}
+		if err := b.charge(name, len(data)); err != nil {
+			return err
+		}
+		uri, err := b.stage(name, data)
+		if err != nil {
+			return err
+		}
+		b.blocks = append(b.blocks, acp.PromptBlock{Type: "resource_link", URI: uri, Name: name, MimeType: mime})
+		return nil
+	}
+	if acpAudioMIMEs[mime] {
+		return b.addAudio(name, mime, data)
+	}
+	textOK := strings.HasPrefix(mime, "text/") || acpTextMIMEs[mime] ||
+		acpTextExtensions[strings.ToLower(filepath.Ext(name))]
+	if !textOK {
+		return b.fail("Antigravity does not support '%s' (%s). Attach a BMP, JPEG, PNG, WebP, PDF, audio, or text file.", name, mime)
+	}
+	if len(data) > acpMaxTextBytes {
+		return b.fail("Attachment '%s' is too large. Antigravity accepts text files up to 1 MiB, images up to 10 MiB, audio up to 20 MiB, and 50 MiB total attachments.", name)
+	}
+	if !utf8.Valid(data) || bytes.IndexByte(data, 0) != -1 {
+		return b.fail("Attachment '%s' is not a UTF-8 text file.", name)
+	}
+	if err := b.charge(name, len(data)); err != nil {
+		return err
+	}
+	uri, err := b.stage(name, data)
+	if err != nil {
+		return err
+	}
+	resource, err := json.Marshal(map[string]string{"uri": uri, "mimeType": mime, "text": string(data)})
+	if err != nil {
+		return b.fail("ACP attachment encoding failed: %v", err)
+	}
+	b.blocks = append(b.blocks, acp.PromptBlock{Type: "resource", Resource: resource})
+	return nil
+}
+
+// handlePart converts one OpenAI content part (chat or Responses shape) to
+// text or attachment blocks. Unknown part types are ignored so provider
+// extensions (reasoning blocks, tool calls) pass through untouched.
+func (b *acpAttachmentBuilder) handlePart(part gjson.Result) error {
+	switch part.Get("type").String() {
+	case "text", "input_text":
+		b.text.WriteString(part.Get("text").String())
+		return nil
+	case "image_url", "input_image":
+		raw := part.Get("image_url.url")
+		if !raw.Exists() {
+			raw = part.Get("image_url")
+		}
+		mime, data, err := parseACPDataURL(raw.String())
+		if err != nil {
+			return b.fail("Image attachment: %v", err)
+		}
+		return b.addImage("image", mime, data)
+	case "input_audio":
+		format := strings.ToLower(strings.TrimSpace(part.Get("input_audio.format").String()))
+		mime, ok := acpAudioFormatMIMEs[format]
+		if !ok {
+			return b.fail("Antigravity does not support audio format '%s'. Attach a BMP, JPEG, PNG, WebP, PDF, audio, or text file.", format)
+		}
+		data, err := base64.StdEncoding.DecodeString(strings.Map(func(r rune) rune {
+			if r == ' ' || r == '\n' || r == '\r' || r == '	' {
+				return -1
+			}
+			return r
+		}, part.Get("input_audio.data").String()))
+		if err != nil {
+			return b.fail("Invalid base64 audio payload: %v", err)
+		}
+		return b.addAudio("audio."+format, mime, data)
+	case "file", "input_file":
+		raw := part.Get("file.file_data")
+		if !raw.Exists() {
+			raw = part.Get("file_data")
+		}
+		name := part.Get("file.filename").String()
+		if name == "" {
+			name = part.Get("filename").String()
+		}
+		if name == "" {
+			name = "attachment"
+		}
+		mime, data, err := parseACPDataURL(raw.String())
+		if err != nil {
+			return b.fail("File attachment '%s': %v", name, err)
+		}
+		return b.addFile(name, mime, data)
+	}
+	return nil
+}
+
+// buildPromptBlocks converts the request payload to ACP prompt blocks and
+// returns a cleanup func for staged attachments (always non-nil; call it
+// after the prompt turn completes). Text merges into one leading block in
+// the historical [ROLE] shape; attachments follow in encounter order.
+func buildPromptBlocks(payload []byte) (blocks []acp.PromptBlock, cleanup func(), err error) {
+	b := &acpAttachmentBuilder{}
+	cleanup = func() {
+		if b.staged != "" {
+			_ = os.RemoveAll(b.staged)
+		}
+	}
+	handleMessage := func(role string, content gjson.Result) error {
+		if content.Type == gjson.String {
+			if t := strings.TrimSpace(content.String()); t != "" {
+				b.text.WriteString(fmt.Sprintf("[%s]: %s\n\n", strings.ToUpper(role), t))
+			}
+			return nil
+		}
+		if !content.IsArray() {
+			return nil
+		}
+		var msgText strings.Builder
+		for _, part := range content.Array() {
+			if part.Get("type").String() == "text" || part.Get("type").String() == "input_text" {
+				msgText.WriteString(part.Get("text").String())
+				continue
+			}
+			if err := b.handlePart(part); err != nil {
+				return err
+			}
+		}
+		if t := strings.TrimSpace(msgText.String()); t != "" {
+			b.text.WriteString(fmt.Sprintf("[%s]: %s\n\n", strings.ToUpper(role), t))
+		}
+		return nil
+	}
+	msgs := gjson.GetBytes(payload, "messages")
+	if msgs.Exists() && msgs.IsArray() {
+		for _, m := range msgs.Array() {
+			if err := handleMessage(m.Get("role").String(), m.Get("content")); err != nil {
+				cleanup()
+				return nil, cleanup, err
+			}
+		}
+	} else if input := gjson.GetBytes(payload, "input"); input.Exists() && input.IsArray() {
+		for _, item := range input.Array() {
+			switch item.Get("type").String() {
+			case "message":
+				if err := handleMessage(item.Get("role").String(), item.Get("content")); err != nil {
+					cleanup()
+					return nil, cleanup, err
+				}
+			default:
+				if err := b.handlePart(item); err != nil {
+					cleanup()
+					return nil, cleanup, err
+				}
+			}
+		}
+	}
+	if t := strings.TrimSpace(b.text.String()); t != "" {
+		blocks = append(blocks, acp.PromptBlock{Type: "text", Text: t})
+	}
+	blocks = append(blocks, b.blocks...)
+	if len(blocks) > 0 {
+		return blocks, cleanup, nil
+	}
+	// Compatibility fallbacks for prompt-shaped payloads.
+	if prompt := gjson.GetBytes(payload, "prompt"); prompt.Exists() && prompt.String() != "" {
+		return acp.NewTextPrompt(prompt.String()), cleanup, nil
+	}
+	return acp.NewTextPrompt(string(payload)), cleanup, nil
+}
+
+// openSession creates one isolated session and applies the requested model
+// variant. A rejected variant is a client error: the message carries the
+// daemon verdict so callers can pick an offered model.
+func openSession(ctx context.Context, client *acp.Client, model string, payload []byte) (string, error) {
 	cwd, _ := os.Getwd()
 	sessionID, err := client.NewSession(ctx, cwd)
 	if err != nil {
@@ -544,52 +979,12 @@ func openSession(ctx context.Context, client *acp.Client, model string) (string,
 		}
 		return "", statusErr{code: http.StatusBadGateway, msg: fmt.Sprintf("ACP session/new failed: %v", err)}
 	}
-	if baseModel := thinking.ParseSuffix(model).ModelName; baseModel != "" {
-		_, _ = client.SetConfigOption(ctx, sessionID, "model", baseModel)
+	if variant := resolveAntigravityModel(model, payload); variant != "" {
+		if _, err := client.SetConfigOption(ctx, sessionID, "model", variant); err != nil {
+			return "", statusErr{code: http.StatusBadRequest, msg: fmt.Sprintf("Antigravity model %q unavailable: %v", variant, err)}
+		}
 	}
 	return sessionID, nil
-}
-
-// extractPromptBlocks converts raw OpenAI/Claude JSON payload to an ACP PromptBlock slice.
-func extractPromptBlocks(payload []byte) []acp.PromptBlock {
-	var blocks []acp.PromptBlock
-
-	// Check if this is an OpenAI-style messages array
-	msgs := gjson.GetBytes(payload, "messages")
-	if msgs.Exists() && msgs.IsArray() {
-		var sb strings.Builder
-		for _, m := range msgs.Array() {
-			role := m.Get("role").String()
-			content := m.Get("content").String()
-			if role != "" && content != "" {
-				sb.WriteString(fmt.Sprintf("[%s]: %s\n\n", strings.ToUpper(role), content))
-			}
-		}
-		if sb.Len() > 0 {
-			blocks = append(blocks, acp.PromptBlock{
-				Type: "text",
-				Text: strings.TrimSpace(sb.String()),
-			})
-			return blocks
-		}
-	}
-
-	// Check if this is a raw prompt or string
-	prompt := gjson.GetBytes(payload, "prompt")
-	if prompt.Exists() && prompt.String() != "" {
-		blocks = append(blocks, acp.PromptBlock{
-			Type: "text",
-			Text: prompt.String(),
-		})
-		return blocks
-	}
-
-	// Fallback to raw string payload
-	blocks = append(blocks, acp.PromptBlock{
-		Type: "text",
-		Text: string(payload),
-	})
-	return blocks
 }
 
 // Execute performs a non-streaming ACP prompt turn.
@@ -604,7 +999,7 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 	}
 	defer client.Close()
 
-	sessionID, err := openSession(ctx, client, req.Model)
+	sessionID, err := openSession(ctx, client, req.Model, req.Payload)
 	if err != nil {
 		return resp, err
 	}
@@ -642,7 +1037,11 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 		}
 	})
 
-	blocks := extractPromptBlocks(req.Payload)
+	blocks, cleanupAttachments, err := buildPromptBlocks(req.Payload)
+	if err != nil {
+		return resp, err
+	}
+	defer cleanupAttachments()
 	stopReason, err := client.Prompt(ctx, sessionID, blocks)
 	if err != nil {
 		return resp, statusErr{code: http.StatusInternalServerError, msg: fmt.Sprintf("ACP prompt error: %v", err)}
@@ -693,7 +1092,7 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 		return nil, err
 	}
 
-	sessionID, err := openSession(ctx, client, req.Model)
+	sessionID, err := openSession(ctx, client, req.Model, req.Payload)
 	if err != nil {
 		client.Close()
 		return nil, err
@@ -742,7 +1141,14 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 			}
 		})
 
-		blocks := extractPromptBlocks(req.Payload)
+		blocks, cleanupAttachments, blocksErr := buildPromptBlocks(req.Payload)
+		if blocksErr != nil {
+			chunkChan <- cliproxyexecutor.StreamChunk{
+				Err: blocksErr,
+			}
+			return
+		}
+		defer cleanupAttachments()
 		_, promptErr := client.Prompt(ctx, sessionID, blocks)
 		if promptErr != nil {
 			log.Errorf("ACP prompt stream error: %v", promptErr)

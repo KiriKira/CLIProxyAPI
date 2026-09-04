@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -302,6 +303,132 @@ func TestAntigravityAcpExecutorMissingBinary(t *testing.T) {
 	defer cancel()
 	if _, err := exec.Execute(ctx, auth, req, cliproxyexecutor.Options{}); err == nil || !strings.Contains(err.Error(), "binary not found") {
 		t.Fatalf("expected binary-missing error, got %v", err)
+	}
+}
+
+func TestResolveAntigravityModel(t *testing.T) {
+	cases := []struct {
+		name    string
+		model   string
+		payload string
+		want    string
+	}{
+		{"bare family defaults high", "gemini-3.7-flash", `{}`, "gemini-3.7-flash-high"},
+		{"explicit variant kept", "gemini-3.7-flash-low", `{}`, "gemini-3.7-flash-low"},
+		{"body effort overrides variant", "gemini-3.7-flash-low", `{"reasoning_effort":"high"}`, "gemini-3.7-flash-high"},
+		{"body effort fills bare family", "gemini-3.8-flash", `{"reasoning_effort":"low"}`, "gemini-3.8-flash-low"},
+		{"level suffix", "gemini-3.8-flash(high)", `{}`, "gemini-3.8-flash-high"},
+		{"suffix wins over body", "gemini-3.8-flash(low)", `{"reasoning_effort":"high"}`, "gemini-3.8-flash-low"},
+		{"xhigh clamps to high", "gemini-3.6-flash(xhigh)", `{}`, "gemini-3.6-flash-high"},
+		{"minimal clamps to low", "gemini-3.6-flash(minimal)", `{}`, "gemini-3.6-flash-low"},
+		{"numeric budget means high", "gemini-3.7-flash(8192)", `{}`, "gemini-3.7-flash-high"},
+		{"none means low", "gemini-3.7-flash(none)", `{}`, "gemini-3.7-flash-low"},
+		{"auto means medium", "gemini-3.7-flash(auto)", `{}`, "gemini-3.7-flash-medium"},
+		{"pro high id kept", "gemini-pro-agent", `{}`, "gemini-pro-agent"},
+		{"pro low via body", "gemini-pro-agent", `{"reasoning_effort":"low"}`, "gemini-3.1-pro-low"},
+		{"pro low via suffix", "gemini-3.1-pro(low)", `{}`, "gemini-3.1-pro-low"},
+		{"pro medium clamps up", "gemini-3.1-pro(medium)", `{}`, "gemini-pro-agent"},
+		{"bare pro means high id", "gemini-3.1-pro", `{}`, "gemini-pro-agent"},
+		{"unknown family passes through", "some-other-model", `{}`, "some-other-model"},
+		{"unknown suffix stripped", "some-other-model(ultra)", `{}`, "some-other-model"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveAntigravityModel(tc.model, []byte(tc.payload)); got != tc.want {
+				t.Errorf("resolveAntigravityModel(%q, %s) = %q, want %q", tc.model, tc.payload, got, tc.want)
+			}
+		})
+	}
+}
+
+const acpTestPixelPNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+
+func TestBuildPromptBlocksTextCompat(t *testing.T) {
+	blocks, cleanup, err := buildPromptBlocks([]byte(`{"messages":[{"role":"user","content":"hi"}]}`))
+	defer cleanup()
+	if err != nil {
+		t.Fatalf("buildPromptBlocks: %v", err)
+	}
+	if len(blocks) != 1 || blocks[0].Type != "text" || blocks[0].Text != "[USER]: hi" {
+		t.Fatalf("unexpected blocks: %+v", blocks)
+	}
+}
+
+func TestBuildPromptBlocksAttachments(t *testing.T) {
+	payload := `{"messages":[{"role":"user","content":[
+		{"type":"text","text":"describe these"},
+		{"type":"image_url","image_url":{"url":"data:image/png;base64,` + acpTestPixelPNG + `"}},
+		{"type":"input_audio","input_audio":{"data":"AAAA","format":"mp3"}},
+		{"type":"file","file":{"file_data":"data:application/pdf;base64,JVBERi0xLjQgZmFrZQ==","filename":"doc.pdf"}},
+		{"type":"file","file":{"file_data":"data:text/plain;base64,aGVsbG8gd29ybGQ=","filename":"notes.txt"}}
+	]}]}`
+	blocks, cleanup, err := buildPromptBlocks([]byte(payload))
+	if err != nil {
+		t.Fatalf("buildPromptBlocks: %v", err)
+	}
+	if len(blocks) != 5 {
+		t.Fatalf("got %d blocks, want 5: %+v", len(blocks), blocks)
+	}
+	if blocks[0].Type != "text" || blocks[0].Text != "[USER]: describe these" {
+		t.Errorf("text block = %+v", blocks[0])
+	}
+	if blocks[1].Type != "image" || blocks[1].MimeType != "image/png" || blocks[1].Data != acpTestPixelPNG {
+		t.Errorf("image block = %+v", blocks[1])
+	}
+	if blocks[2].Type != "audio" || blocks[2].MimeType != "audio/mpeg" {
+		t.Errorf("audio block = %+v", blocks[2])
+	}
+	if blocks[3].Type != "resource_link" || blocks[3].MimeType != "application/pdf" || !strings.HasPrefix(blocks[3].URI, "file://") {
+		t.Errorf("pdf block = %+v", blocks[3])
+	} else if _, statErr := os.Stat(strings.TrimPrefix(blocks[3].URI, "file://")); statErr != nil {
+		t.Errorf("staged pdf missing: %v", statErr)
+	}
+	if blocks[4].Type != "resource" || !strings.Contains(string(blocks[4].Resource), "hello world") {
+		t.Errorf("text file block = %+v", blocks[4])
+	}
+	cleanup()
+	if strings.HasPrefix(blocks[3].URI, "file://") {
+		if _, statErr := os.Stat(strings.TrimPrefix(blocks[3].URI, "file://")); !os.IsNotExist(statErr) {
+			t.Errorf("staged pdf not cleaned: %v", statErr)
+		}
+	}
+}
+
+func TestBuildPromptBlocksRejects(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload string
+		want    string
+	}{
+		{"unsupported image mime", `{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/gif;base64,AAAA"}}]}]}`, "does not support"},
+		{"remote url", `{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/a.png"}}]}]}`, "data URLs"},
+		{"unknown audio format", `{"messages":[{"role":"user","content":[{"type":"input_audio","input_audio":{"data":"AAAA","format":"midi"}}]}]}`, "does not support"},
+		{"oversize text", `{"messages":[{"role":"user","content":[{"type":"file","file":{"file_data":"data:text/plain;base64,` + base64.StdEncoding.EncodeToString(make([]byte, 2<<20)) + `","filename":"big.txt"}}]}]}`, "too large"},
+		{"binary text file", `{"messages":[{"role":"user","content":[{"type":"file","file":{"file_data":"data:text/plain;base64,AABh","filename":"bin.txt"}}]}]}`, "not a UTF-8"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, cleanup, err := buildPromptBlocks([]byte(tc.payload))
+			defer cleanup()
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("err = %v, want substring %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestBuildPromptBlocksResponsesInput(t *testing.T) {
+	payload := `{"input":[
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"look"}]},
+		{"type":"input_image","image_url":"data:image/png;base64,` + acpTestPixelPNG + `"}
+	]}`
+	blocks, cleanup, err := buildPromptBlocks([]byte(payload))
+	defer cleanup()
+	if err != nil {
+		t.Fatalf("buildPromptBlocks: %v", err)
+	}
+	if len(blocks) != 2 || blocks[0].Type != "text" || blocks[1].Type != "image" {
+		t.Fatalf("unexpected blocks: %+v", blocks)
 	}
 }
 
