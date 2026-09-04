@@ -62,6 +62,8 @@ func (c *Client) Authenticate(ctx context.Context, methodID string) error {
 
 // NewSession opens a new agent session rooted at cwd. MCPServers is forced
 // to an empty array (never null) because the ACP schema expects an array.
+// The negotiated configOptions snapshot is cached for later model/mode
+// selection via ConfigOptions/SetConfigOption.
 func (c *Client) NewSession(ctx context.Context, cwd string) (string, error) {
 	raw, err := c.call(ctx, "session/new", newSessionRequest{
 		CWD:        cwd,
@@ -77,6 +79,7 @@ func (c *Client) NewSession(ctx context.Context, cwd string) (string, error) {
 	if resp.SessionID == "" {
 		return "", fmt.Errorf("acp: session/new returned empty sessionId")
 	}
+	c.storeConfigOptions(resp.SessionID, resp.ConfigOptions)
 	return resp.SessionID, nil
 }
 

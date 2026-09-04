@@ -44,10 +44,13 @@ type SpawnConfig struct {
 	OnUpdate func(SessionUpdate)
 }
 
-// callResult is the outcome of one outbound request.
+// callResult is the outcome of one outbound request. Exactly one of the
+// fields is set: a live agent answers with result/rpcErr, while a dead
+// transport fails the waiter with transportErr.
 type callResult struct {
-	result json.RawMessage
-	rpcErr *rpcErrorObject
+	result       json.RawMessage
+	rpcErr       *rpcErrorObject
+	transportErr error
 }
 
 // pendingCall tracks one in-flight outbound request.
@@ -75,6 +78,9 @@ type Client struct {
 
 	updateMu sync.RWMutex
 	onUpdate func(SessionUpdate)
+
+	cfgMu   sync.Mutex
+	sessCfg map[string][]SessionConfigOption
 
 	closedMu sync.Mutex
 	closed   bool
@@ -150,7 +156,7 @@ func NewClient(cfg SpawnConfig) (*Client, error) {
 	c.cmd = cmd
 	go func() {
 		c.exitCh <- cmd.Wait()
-		c.failAllPending(fmt.Errorf("acp: agent process exited"))
+		c.failAllPending(transportErrorf("agent process exited"))
 	}()
 	return c, nil
 }
@@ -192,7 +198,7 @@ func (c *Client) Close() error {
 	c.closedMu.Lock()
 	c.closeErr = err
 	c.closedMu.Unlock()
-	c.failAllPending(errors.New("acp: client closed"))
+	c.failAllPending(transportErrorf("client closed"))
 	if c.cmd != nil && c.cmd.Process != nil {
 		go reapAfterGrace(c.cmd.Process)
 	}
@@ -219,7 +225,7 @@ func (c *Client) isClosed() bool {
 // cannot leak a goroutine.
 func (c *Client) call(ctx context.Context, method string, params any) (json.RawMessage, error) {
 	if c.isClosed() {
-		return nil, errors.New("acp: client is closed")
+		return nil, transportErrorf("client is closed")
 	}
 	id := c.nextID.Add(1)
 	idRaw, _ := json.Marshal(id)
@@ -243,7 +249,7 @@ func (c *Client) call(ctx context.Context, method string, params any) (json.RawM
 	c.pendingMu.Lock()
 	if c.isClosed() {
 		c.pendingMu.Unlock()
-		return nil, errors.New("acp: client is closed")
+		return nil, transportErrorf("client is closed")
 	}
 	c.pending[key] = pendingCall{ch: ch}
 	c.pendingMu.Unlock()
@@ -253,7 +259,7 @@ func (c *Client) call(ctx context.Context, method string, params any) (json.RawM
 	c.writeMu.Unlock()
 	if werr != nil {
 		c.removePending(key)
-		return nil, fmt.Errorf("acp: write %s: %w", method, werr)
+		return nil, transportErrorf("write %s: %v", method, werr)
 	}
 
 	select {
@@ -261,8 +267,11 @@ func (c *Client) call(ctx context.Context, method string, params any) (json.RawM
 		c.removePending(key)
 		return nil, ctx.Err()
 	case res := <-ch:
+		if res.transportErr != nil {
+			return nil, res.transportErr
+		}
 		if res.rpcErr != nil {
-			return nil, fmt.Errorf("acp: %s: agent error %d: %s", method, res.rpcErr.Code, res.rpcErr.Message)
+			return nil, &RPCError{Code: res.rpcErr.Code, Message: res.rpcErr.Message}
 		}
 		return res.result, nil
 	}
@@ -307,7 +316,7 @@ func (c *Client) failAllPending(err error) {
 func (c *Client) failAllPendingLocked(err error) {
 	for key, p := range c.pending {
 		select {
-		case p.ch <- callResult{rpcErr: &rpcErrorObject{Code: rpcInternalErrorCode, Message: err.Error()}}:
+		case p.ch <- callResult{transportErr: err}:
 		default:
 		}
 		delete(c.pending, key)

@@ -3,7 +3,6 @@ package acp
 import (
 	"bufio"
 	"encoding/json"
-	"fmt"
 	"io"
 )
 
@@ -37,7 +36,7 @@ func (c *Client) readLoop() {
 			c.dispatchNotification(&msg)
 		}
 	}
-	c.failAllPending(fmt.Errorf("acp: agent stdout closed"))
+	c.failAllPending(transportErrorf("agent stdout closed"))
 }
 
 func (c *Client) dispatchResponse(m *wireMessage) {

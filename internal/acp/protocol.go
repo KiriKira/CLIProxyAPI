@@ -139,9 +139,11 @@ type newSessionRequest struct {
 	MCPServers []json.RawMessage `json:"mcpServers"`
 }
 
-// NewSessionResponse carries the agent-assigned session identifier.
+// NewSessionResponse carries the agent-assigned session identifier plus the
+// negotiated configOptions snapshot (model/mode/thought_level selectors).
 type newSessionResponse struct {
-	SessionID string `json:"sessionId"`
+	SessionID     string                `json:"sessionId"`
+	ConfigOptions []SessionConfigOption `json:"configOptions,omitempty"`
 }
 
 // PromptRequest params deliver one conversational turn.

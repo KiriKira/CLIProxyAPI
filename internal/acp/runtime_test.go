@@ -47,7 +47,7 @@ func startFakeAgent(t *testing.T, toAgentR io.Reader, toAgentW io.WriteCloser, f
 				// one session/request_permission to exercise default handlers.
 				ag.sendLine(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk"}}}`)
 				ag.sendLine(`{"jsonrpc":"2.0","id":"perm-1","method":"session/request_permission","params":{"sessionId":"sess-1"}}`)
-				resp.Result = json.RawMessage(`{"sessionId":"sess-1"}`)
+				resp.Result = json.RawMessage(`{"sessionId":"sess-1","configOptions":[{"id":"model","type":"select","category":"model","name":"Model","currentValue":"gemini-3.7-flash","options":[{"name":"Gemini 3.8 Flash","value":"gemini-3.8-flash"},{"name":"Legacy","options":[{"name":"Gemini 3.7 Flash","value":"gemini-3.7-flash"}]}]}]}`)
 			case "session/prompt":
 				ag.sendLine(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk"}}}`)
 				resp.Result = json.RawMessage(`{"stopReason":"end_turn"}`)
