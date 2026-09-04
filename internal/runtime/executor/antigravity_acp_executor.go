@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -281,6 +283,10 @@ func (e *AntigravityAcpExecutor) spawnClient(ctx context.Context, auth *cliproxy
 	if err := writeProfileSettings(profileDir, ac); err != nil {
 		return nil, statusErr{code: http.StatusBadGateway, msg: err.Error()}
 	}
+	// Best effort: keep a fresh access token in the daemon file. The agent
+	// normalizes the file to refresh-only after each success, so without
+	// this every spawn after the first would fall back to browser login.
+	_ = ensureDaemonToken(ctx, profileDir, ac.method)
 
 	env := []string{
 		"PATH=" + os.Getenv("PATH"),
@@ -326,6 +332,185 @@ func (e *AntigravityAcpExecutor) spawnClient(ctx context.Context, auth *cliproxy
 		return nil, e.mapAuthError(ac, err)
 	}
 	return client, nil
+}
+
+// acpTokenEndpoint is the Google OAuth token endpoint used to refresh the
+// daemon token file. Overridable in tests.
+var acpTokenEndpoint = "https://oauth2.googleapis.com/token"
+
+// acpDaemonTokenFreshness is the minimum remaining token lifetime that
+// counts as fresh. Below it the executor refreshes proactively.
+const acpDaemonTokenFreshness = 10 * time.Minute
+
+// acpTokenRefreshTimeout bounds the proactive refresh HTTP call. It runs
+// during credential acquisition, the only phase where timeouts are allowed.
+const acpTokenRefreshTimeout = 30 * time.Second
+
+// acpDaemonOAuthClientID/Secret are the public installed-app OAuth client
+// shipped inside the official ACP daemon (copied from the Go Antigravity CLI
+// constants, as the daemon's own default). They are not user secrets: the
+// client ID appears in every browser login URL the daemon prints, and the
+// codebase already bundles its own OAuth clients the same way.
+const (
+	acpDaemonOAuthClientID     = "[REDACTED]"
+	acpDaemonOAuthClientSecret = "[REDACTED]"
+)
+
+var acpDaemonDefaultScopes = []string{
+	"https://www.googleapis.com/auth/cloud-platform",
+	"https://www.googleapis.com/auth/userinfo.email",
+	"https://www.googleapis.com/auth/aicode",
+}
+
+// daemonTokenFile returns the OAuth token filename for the method, or "" when
+// the method keeps no file credential.
+func daemonTokenFile(method string) string {
+	switch method {
+	case acpAuthOAuthPersonal:
+		return "acp_token.json"
+	case acpAuthOAuthBusiness:
+		return "acp_business_token.json"
+	default:
+		return ""
+	}
+}
+
+// daemonTokenFresh reports whether the blob already carries an access token
+// valid well past now. Unknown shapes count as stale so the caller refreshes.
+func daemonTokenFresh(blob map[string]any) bool {
+	token, _ := blob["token"].(string)
+	expiryRaw, _ := blob["expiry"].(string)
+	if token == "" || expiryRaw == "" {
+		return false
+	}
+	expiry, err := time.Parse(time.RFC3339, expiryRaw)
+	if err != nil {
+		return false
+	}
+	return time.Until(expiry) > acpDaemonTokenFreshness
+}
+
+// refreshDaemonAccessToken mints a fresh access token for a daemon-issued
+// refresh token. It returns the access token, its expiry, and a rotated
+// refresh token (empty when the server did not rotate).
+func refreshDaemonAccessToken(ctx context.Context, clientID, clientSecret, refreshToken string) (accessToken string, expiry time.Time, rotatedRefresh string, err error) {
+	form := url.Values{
+		"grant_type":    {"refresh_token"},
+		"client_id":     {clientID},
+		"client_secret": {clientSecret},
+		"refresh_token": {refreshToken},
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, acpTokenEndpoint, strings.NewReader(form.Encode()))
+	if err != nil {
+		return "", time.Time{}, "", err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", time.Time{}, "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return "", time.Time{}, "", err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", time.Time{}, "", fmt.Errorf("token refresh status %d", resp.StatusCode)
+	}
+	var decoded struct {
+		AccessToken  string `json:"access_token"`
+		ExpiresIn    int64  `json:"expires_in"`
+		RefreshToken string `json:"refresh_token"`
+	}
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		return "", time.Time{}, "", err
+	}
+	if decoded.AccessToken == "" || decoded.ExpiresIn <= 0 {
+		return "", time.Time{}, "", fmt.Errorf("token refresh returned no usable token")
+	}
+	return decoded.AccessToken, time.Now().Add(time.Duration(decoded.ExpiresIn) * time.Second).UTC(), decoded.RefreshToken, nil
+}
+
+// ensureDaemonToken keeps a fresh access token in the daemon token file so
+// the agent never needs its in-daemon refresh path on spawn. Unknown or
+// missing state is left alone (nil error): the daemon then reports sign-in
+// required through the normal bounded authenticate step.
+func ensureDaemonToken(ctx context.Context, profileDir, method string) error {
+	name := daemonTokenFile(method)
+	if name == "" {
+		return nil
+	}
+	path := filepath.Join(profileDir, "antigravity-acp", name)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var blob map[string]any
+	if err := json.Unmarshal(raw, &blob); err != nil || blob == nil {
+		return nil
+	}
+	if daemonTokenFresh(blob) {
+		return nil
+	}
+	refresh, _ := blob["refresh_token"].(string)
+	if refresh == "" {
+		return nil
+	}
+	clientID, _ := blob["client_id"].(string)
+	clientSecret, _ := blob["client_secret"].(string)
+	if clientID == "" {
+		clientID = acpDaemonOAuthClientID
+	}
+	if clientSecret == "" {
+		clientSecret = acpDaemonOAuthClientSecret
+	}
+	rctx, cancel := context.WithTimeout(ctx, acpTokenRefreshTimeout)
+	defer cancel()
+	accessToken, expiry, rotated, err := refreshDaemonAccessToken(rctx, clientID, clientSecret, refresh)
+	if err != nil {
+		log.Warnf("Antigravity ACP proactive token refresh failed: %v", err)
+		return nil
+	}
+	blob["token"] = accessToken
+	blob["expiry"] = expiry.Format(time.RFC3339)
+	if rotated != "" {
+		blob["refresh_token"] = rotated
+	}
+	blob["client_id"] = clientID
+	blob["client_secret"] = clientSecret
+	if _, ok := blob["token_uri"]; !ok {
+		blob["token_uri"] = acpTokenEndpoint
+	}
+	if _, ok := blob["scopes"]; !ok {
+		blob["scopes"] = acpDaemonDefaultScopes
+	}
+	out, err := json.Marshal(blob)
+	if err != nil {
+		return nil
+	}
+	tmp, err := os.CreateTemp(filepath.Join(profileDir, "antigravity-acp"), "token-*.tmp")
+	if err != nil {
+		log.Warnf("Antigravity ACP token write failed: %v", err)
+		return nil
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(append(out, '\n')); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return nil
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return nil
+	}
+	_ = os.Chmod(tmpName, 0o600)
+	if err := os.Rename(tmpName, path); err != nil {
+		_ = os.Remove(tmpName)
+		log.Warnf("Antigravity ACP token write failed: %v", err)
+		return nil
+	}
+	_ = os.Chmod(path, 0o600)
+	return nil
 }
 
 // acpUIDArgs mirrors the official launch contract: --uid= on linux.

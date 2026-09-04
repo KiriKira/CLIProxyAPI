@@ -3,6 +3,8 @@ package executor
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -309,6 +311,112 @@ func TestSanitizeProfileName(t *testing.T) {
 	}
 	if got := sanitizeProfileName(""); got != "default" {
 		t.Errorf("got %q", got)
+	}
+}
+
+func writeDaemonToken(t *testing.T, dir, name, blob string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(dir, "antigravity-acp"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "antigravity-acp", name), []byte(blob), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func readDaemonToken(t *testing.T, dir, name string) map[string]any {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(dir, "antigravity-acp", name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var blob map[string]any
+	if err := json.Unmarshal(raw, &blob); err != nil {
+		t.Fatal(err)
+	}
+	return blob
+}
+
+func TestEnsureDaemonTokenRefreshesStaleBlob(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"fresh-at","expires_in":3600,"token_type":"Bearer"}`))
+	}))
+	t.Cleanup(srv.Close)
+	oldEndpoint := acpTokenEndpoint
+	acpTokenEndpoint = srv.URL
+	t.Cleanup(func() { acpTokenEndpoint = oldEndpoint })
+
+	dir := t.TempDir()
+	writeDaemonToken(t, dir, "acp_token.json", `{"client_id":"cid","client_secret":"csec","refresh_token":"rt","token_uri":"x","scopes":["s"],"project_id":"p"}`)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := ensureDaemonToken(ctx, dir, "oauth-personal"); err != nil {
+		t.Fatalf("ensureDaemonToken: %v", err)
+	}
+	if hits != 1 {
+		t.Fatalf("refresh hits = %d, want 1", hits)
+	}
+	blob := readDaemonToken(t, dir, "acp_token.json")
+	if blob["token"] != "fresh-at" {
+		t.Errorf("token = %v, want fresh-at", blob["token"])
+	}
+	if blob["refresh_token"] != "rt" {
+		t.Errorf("refresh_token was clobbered: %v", blob["refresh_token"])
+	}
+	if blob["project_id"] != "p" {
+		t.Errorf("project_id was dropped: %v", blob["project_id"])
+	}
+	expiry, _ := blob["expiry"].(string)
+	exp, err := time.Parse(time.RFC3339, expiry)
+	if err != nil || time.Until(exp) < 50*time.Minute {
+		t.Errorf("expiry = %v, err = %v, want ~1h future", expiry, err)
+	}
+}
+
+func TestEnsureDaemonTokenSkipsFreshBlob(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+	}))
+	t.Cleanup(srv.Close)
+	oldEndpoint := acpTokenEndpoint
+	acpTokenEndpoint = srv.URL
+	t.Cleanup(func() { acpTokenEndpoint = oldEndpoint })
+
+	dir := t.TempDir()
+	expiry := time.Now().Add(2 * time.Hour).UTC().Format(time.RFC3339)
+	writeDaemonToken(t, dir, "acp_token.json", `{"refresh_token":"rt","token":"at","expiry":"`+expiry+`"}`)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := ensureDaemonToken(ctx, dir, "oauth-personal"); err != nil {
+		t.Fatalf("ensureDaemonToken: %v", err)
+	}
+	if hits != 0 {
+		t.Fatalf("refresh hits = %d, want 0", hits)
+	}
+}
+
+func TestEnsureDaemonTokenToleratesMissingState(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	// No file at all.
+	if err := ensureDaemonToken(ctx, t.TempDir(), "oauth-personal"); err != nil {
+		t.Fatalf("missing file: %v", err)
+	}
+	// API-key methods keep no file.
+	if err := ensureDaemonToken(ctx, t.TempDir(), "gemini-api-key"); err != nil {
+		t.Fatalf("api-key method: %v", err)
+	}
+	// Blob without refresh token.
+	dir := t.TempDir()
+	writeDaemonToken(t, dir, "acp_token.json", `{"client_id":"cid"}`)
+	if err := ensureDaemonToken(ctx, dir, "oauth-personal"); err != nil {
+		t.Fatalf("no refresh token: %v", err)
 	}
 }
 

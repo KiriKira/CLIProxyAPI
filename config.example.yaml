@@ -300,6 +300,13 @@ codex:
 #   sensitive-words:             # optional: words to obfuscate with zero-width characters in system instructions
 #     - "API"
 #     - "proxy"
+#   use-acp: false                # optional: route through the official local ACP daemon instead of legacy REST
+#   binary-path: ""               # optional: path to agy_acp_server executable (else PATH/AGY_ACP_BINARY lookup)
+#   gemini-home: ""               # optional: daemon profile dir; defaults to an isolated per-auth directory.
+#                                 # Point at an existing logged-in Gemini home to reuse its sign-in.
+#   auth-method: ""               # optional: oauth-personal (default), oauth-business, gemini-api-key, agent-platform
+#   gcp-project: ""               # optional: needed for oauth-business / agent-platform
+#   gcp-location: ""              # optional: needed for oauth-business / agent-platform
 
 # xAI provider behavior.
 xai:
