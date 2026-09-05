@@ -155,9 +155,18 @@ type AntigravityConfig struct {
 	// across requests instead of spawning and terminating a new process per request.
 	// Default: true. Set to false to force per-request cold spawn (legacy mode).
 	PersistentProcess *bool `yaml:"persistent-process,omitempty" json:"persistent-process,omitempty"`
-	// MaxWorkers is the maximum number of persistent daemon worker processes.
-	// Default: 1 (recommended for low-memory VPS environments like 512MB RAM).
+	// MaxWorkers is the maximum number of persistent daemon worker processes
+	// per auth identity. A busy worker no longer forces a concurrent same-auth
+	// request to inherit the full generation time as queueing delay; excess
+	// requests spawn additional workers up to this cap. Default: 1 (previous
+	// single-worker-per-auth behavior; recommended for low-memory VPS).
 	MaxWorkers int `yaml:"max-workers,omitempty" json:"max-workers,omitempty"`
+	// MaxWorkersTotal caps persistent daemon worker processes across all auth
+	// identities. The cap is strict: at capacity, an incoming key evicts the
+	// oldest idle worker of another key, otherwise it queues. Zero means the
+	// per-auth cap is the only bound (legacy behavior). Recommended: equal to
+	// MaxWorkers on single-identity deployments.
+	MaxWorkersTotal int `yaml:"max-workers-total,omitempty" json:"max-workers-total,omitempty"`
 	// IdleTimeout is the duration after which an idle persistent worker process is
 	// terminated to reclaim system memory. Empty or "0" disables idle termination (daemon stays warm).
 	// Example: "10m", "1h".

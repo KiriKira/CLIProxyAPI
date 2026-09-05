@@ -303,7 +303,8 @@ codex:
 #   gcp-project: ""               # optional: needed for oauth-business / agent-platform
 #   gcp-location: ""              # optional: needed for oauth-business / agent-platform
 #   persistent-process: true      # optional: keep daemon warm across requests (default: true)
-#   max-workers: 1                # optional: max persistent daemon worker processes (default: 1)
+#   max-workers: 1                # optional: max daemon workers per auth identity (default: 1)
+#   max-workers-total: 0          # optional: strict cap across all identities (0 = per-auth caps only)
 #   idle-timeout: "0"             # optional: terminate idle persistent workers after duration (e.g. "10m", "1h"); "0" means stay warm
 
 # xAI provider behavior.

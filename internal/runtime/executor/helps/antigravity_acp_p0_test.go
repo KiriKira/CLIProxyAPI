@@ -19,7 +19,9 @@ func TestAntigravityAcpPool_P0_SpawningBarrier(t *testing.T) {
 	spawnStarted := make(chan struct{}, 2)
 	spawnBlock := make(chan struct{})
 
-	pool := NewAntigravityAcpPool(2, 0, func(ctx context.Context, key string) (*acp.Client, error) {
+	// Per-auth cap 1: concurrent same-key cold acquires must share ONE spawn
+	// (the spawning barrier), not launch duplicate daemons.
+	pool := NewAntigravityAcpPool(1, 0, func(ctx context.Context, key string) (*acp.Client, error) {
 		spawnCount.Add(1)
 		spawnStarted <- struct{}{}
 		<-spawnBlock

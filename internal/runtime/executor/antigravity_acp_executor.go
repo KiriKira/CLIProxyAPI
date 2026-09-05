@@ -57,6 +57,7 @@ func NewAntigravityAcpExecutor(cfg *internalconfig.Config) *AntigravityAcpExecut
 
 	persistent := true
 	maxWorkers := 1
+	var maxTotal int
 	var idleTimeout time.Duration
 
 	if cfg != nil {
@@ -66,13 +67,16 @@ func NewAntigravityAcpExecutor(cfg *internalconfig.Config) *AntigravityAcpExecut
 		if cfg.Antigravity.MaxWorkers > 0 {
 			maxWorkers = cfg.Antigravity.MaxWorkers
 		}
+		if cfg.Antigravity.MaxWorkersTotal > 0 {
+			maxTotal = cfg.Antigravity.MaxWorkersTotal
+		}
 		if d, err := time.ParseDuration(cfg.Antigravity.IdleTimeout); err == nil && d > 0 {
 			idleTimeout = d
 		}
 	}
 
 	if persistent {
-		exec.pool = helps.NewAntigravityAcpPool(maxWorkers, idleTimeout, nil)
+		exec.pool = helps.NewAntigravityAcpPoolWithLimits(maxWorkers, maxTotal, idleTimeout, nil)
 	}
 
 	return exec
@@ -1068,7 +1072,10 @@ func buildPromptBlocks(payload []byte) (blocks []acp.PromptBlock, cleanup func()
 
 // openSession creates one isolated session and applies the requested model
 // variant. A rejected variant is a client error: the message carries the
-// daemon verdict so callers can pick an offered model.
+// daemon verdict so callers can pick an offered model. When the freshly
+// created session already selects the resolved variant, the redundant
+// session/set_config_option round trip is skipped — this removes one ACP
+// round trip from the warm-path critical section before session/prompt.
 func openSession(ctx context.Context, client *acp.Client, model string, payload []byte) (string, error) {
 	cwd, _ := os.Getwd()
 	sessionID, err := client.NewSession(ctx, cwd)
@@ -1078,12 +1085,63 @@ func openSession(ctx context.Context, client *acp.Client, model string, payload 
 		}
 		return "", statusErr{code: http.StatusBadGateway, msg: fmt.Sprintf("ACP session/new failed: %v", err)}
 	}
-	if variant := resolveAntigravityModel(model, payload); variant != "" {
-		if _, err := client.SetConfigOption(ctx, sessionID, "model", variant); err != nil {
-			return "", statusErr{code: http.StatusBadRequest, msg: fmt.Sprintf("Antigravity model %q unavailable: %v", variant, err)}
-		}
+	variant := resolveAntigravityModel(model, payload)
+	if variant == "" {
+		return sessionID, nil
+	}
+	if acp.CurrentModel(client.ConfigOptions(sessionID)) == variant {
+		// The daemon-created session already runs the requested model
+		// variant; setting it again would be a wasted round trip.
+		return sessionID, nil
+	}
+	if _, err := client.SetConfigOption(ctx, sessionID, "model", variant); err != nil {
+		return "", statusErr{code: http.StatusBadRequest, msg: fmt.Sprintf("Antigravity model %q unavailable: %v", variant, err)}
 	}
 	return sessionID, nil
+}
+
+// acpTTFTStage records one stage boundary of the ACP request path. Stage
+// timings distinguish proxy overhead from backend/model latency so
+// optimization effort follows the dominant cost instead of guesswork.
+type acpTTFTStage struct {
+	requestEnter       time.Time
+	poolAcquired       time.Time
+	sessionNewDone     time.Time
+	modelConfigDone    time.Time
+	promptBuilt        time.Time
+	promptWritten      time.Time
+	firstACPStdoutLine time.Time
+	firstSessionUpdate time.Time
+	firstChunkEnqueued time.Time
+}
+
+// elapsed returns the millisecond offset of t from the request-enter
+// timestamp, or -1 when the stage was never reached.
+func (s *acpTTFTStage) elapsed(t time.Time) int64 {
+	if t.IsZero() || s.requestEnter.IsZero() {
+		return -1
+	}
+	return t.Sub(s.requestEnter).Milliseconds()
+}
+
+// logStageTimings dumps the stage table relative to request_enter. Stages
+// that never happened stay at -1. One log line per request keeps the cost
+// negligible while making proxy-vs-backend attribution possible offline.
+func (s *acpTTFTStage) logStageTimings(model string, stream bool) {
+	log.WithFields(log.Fields{
+		"provider":            "antigravity-acp",
+		"model":               model,
+		"stream":              stream,
+		"pool_wait_ms":        s.elapsed(s.poolAcquired),
+		"session_new_ms":      s.elapsed(s.sessionNewDone),
+		"model_config_ms":     s.elapsed(s.modelConfigDone),
+		"prompt_build_ms":     s.elapsed(s.promptBuilt),
+		"prompt_write_ms":     s.elapsed(s.promptWritten),
+		"first_output_ms":     s.elapsed(s.firstACPStdoutLine),
+		"first_update_ms":     s.elapsed(s.firstSessionUpdate),
+		"first_chunk_ms":      s.elapsed(s.firstChunkEnqueued),
+		"first_token_ttft_ms": s.elapsed(s.firstSessionUpdate),
+	}).Info("ACP TTFT stage timings")
 }
 
 // Execute performs a non-streaming ACP prompt turn.
@@ -1091,6 +1149,8 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 	if opts.Alt == "responses/compact" {
 		return resp, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
 	}
+
+	stages := &acpTTFTStage{requestEnter: time.Now()}
 
 	var client *acp.Client
 	var worker *helps.AntigravityAcpWorker
@@ -1113,12 +1173,28 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 		client = c
 		defer client.Close()
 	}
+	stages.poolAcquired = time.Now()
 
 	healthy := true
 	defer func() {
 		if worker != nil {
 			e.pool.Release(worker, healthy)
 		}
+	}()
+
+	// Prompt construction runs concurrently with session setup: the request
+	// payload is already fully available, so pre-prompt latency approaches
+	// max(session setup, prompt build) instead of their sum. This matters
+	// for large histories and attachment staging.
+	type promptResult struct {
+		blocks  []acp.PromptBlock
+		cleanup func()
+		err     error
+	}
+	promptCh := make(chan promptResult, 1)
+	go func() {
+		blocks, cleanupAttachments, buildErr := buildPromptBlocks(req.Payload)
+		promptCh <- promptResult{blocks, cleanupAttachments, buildErr}
 	}()
 
 	sessionID, err := openSession(ctx, client, req.Model, req.Payload)
@@ -1128,15 +1204,26 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 		}
 		return resp, err
 	}
+	stages.sessionNewDone = time.Now()
+	stages.modelConfigDone = time.Now()
+
+	prompt := <-promptCh
+	if prompt.err != nil {
+		return resp, prompt.err
+	}
+	defer prompt.cleanup()
+	stages.promptBuilt = time.Now()
 
 	var responseText strings.Builder
 	var thoughtText strings.Builder
 	var mu sync.Mutex
 
+	firstUpdateOnce := sync.Once{}
 	client.OnUpdate(func(u acp.SessionUpdate) {
 		if u.SessionID != sessionID {
 			return
 		}
+		firstUpdateOnce.Do(func() { stages.firstSessionUpdate = time.Now() })
 		mu.Lock()
 		defer mu.Unlock()
 
@@ -1162,12 +1249,6 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 		}
 	})
 
-	blocks, cleanupAttachments, err := buildPromptBlocks(req.Payload)
-	if err != nil {
-		return resp, err
-	}
-	defer cleanupAttachments()
-
 	promptDone := make(chan struct{})
 	defer close(promptDone)
 	go func() {
@@ -1178,7 +1259,8 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 		}
 	}()
 
-	stopReason, err := client.Prompt(ctx, sessionID, blocks)
+	stages.promptWritten = time.Now()
+	stopReason, err := client.Prompt(ctx, sessionID, prompt.blocks)
 	if err != nil {
 		if acp.IsTransportError(err) {
 			healthy = false
@@ -1219,6 +1301,8 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 		rawResp = helps.EnsureResponsesUsageDetails(rawResp)
 	}
 
+	stages.firstChunkEnqueued = time.Now()
+	stages.logStageTimings(req.Model, false)
 	return cliproxyexecutor.Response{
 		Payload: rawResp,
 		Headers: make(http.Header),
@@ -1230,6 +1314,8 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 	if opts.Alt == "responses/compact" {
 		return nil, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
 	}
+
+	stages := &acpTTFTStage{requestEnter: time.Now()}
 
 	var client *acp.Client
 	var worker *helps.AntigravityAcpWorker
@@ -1251,6 +1337,20 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 		}
 		client = c
 	}
+	stages.poolAcquired = time.Now()
+
+	// Prompt construction runs concurrently with session setup so the
+	// pre-prompt latency approaches max(session setup, prompt build).
+	type promptResult struct {
+		blocks  []acp.PromptBlock
+		cleanup func()
+		err     error
+	}
+	promptCh := make(chan promptResult, 1)
+	go func() {
+		blocks, cleanupAttachments, buildErr := buildPromptBlocks(req.Payload)
+		promptCh <- promptResult{blocks, cleanupAttachments, buildErr}
+	}()
 
 	sessionID, err := openSession(ctx, client, req.Model, req.Payload)
 	if err != nil {
@@ -1261,6 +1361,8 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 		}
 		return nil, err
 	}
+	stages.sessionNewDone = time.Now()
+	stages.modelConfigDone = time.Now()
 
 	chunkChan := make(chan cliproxyexecutor.StreamChunk, 128)
 	result := &cliproxyexecutor.StreamResult{
@@ -1269,7 +1371,9 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 	}
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	var streamParam any
+	firstChunkOnce := sync.Once{}
 	emitChunk := func(payload []byte) {
+		firstChunkOnce.Do(func() { stages.firstChunkEnqueued = time.Now() })
 		if responseFormat != sdktranslator.FormatOpenAIResponse {
 			chunkChan <- cliproxyexecutor.StreamChunk{Payload: payload}
 			return
@@ -1288,12 +1392,25 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 				client.Close()
 			}
 			close(chunkChan)
+			stages.logStageTimings(req.Model, true)
 		}()
 
+		prompt := <-promptCh
+		if prompt.err != nil {
+			chunkChan <- cliproxyexecutor.StreamChunk{
+				Err: prompt.err,
+			}
+			return
+		}
+		defer prompt.cleanup()
+		stages.promptBuilt = time.Now()
+
+		firstUpdateOnce := sync.Once{}
 		client.OnUpdate(func(u acp.SessionUpdate) {
 			if u.SessionID != sessionID {
 				return
 			}
+			firstUpdateOnce.Do(func() { stages.firstSessionUpdate = time.Now() })
 
 			switch u.Kind {
 			case "agent_message_chunk":
@@ -1319,15 +1436,6 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 			}
 		})
 
-		blocks, cleanupAttachments, blocksErr := buildPromptBlocks(req.Payload)
-		if blocksErr != nil {
-			chunkChan <- cliproxyexecutor.StreamChunk{
-				Err: blocksErr,
-			}
-			return
-		}
-		defer cleanupAttachments()
-
 		promptDone := make(chan struct{})
 		defer close(promptDone)
 		go func() {
@@ -1338,7 +1446,8 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 			}
 		}()
 
-		_, promptErr := client.Prompt(ctx, sessionID, blocks)
+		stages.promptWritten = time.Now()
+		_, promptErr := client.Prompt(ctx, sessionID, prompt.blocks)
 		if promptErr != nil {
 			if acp.IsTransportError(promptErr) {
 				healthy = false

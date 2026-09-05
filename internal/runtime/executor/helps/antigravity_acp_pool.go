@@ -46,12 +46,29 @@ func (w *AntigravityAcpWorker) MarkDead(err error) {
 }
 
 // AntigravityAcpPool manages persistent ACP daemon workers.
+//
+// Workers are grouped per auth key. A single auth may own several workers up
+// to the configured limits, so one slow generation never makes a concurrent
+// same-auth request inherit the full generation time as artificial queueing
+// delay. The sum of workers across all keys is capped by maxTotal; each live
+// worker holds one slot token from spawn until removal, which makes the cap
+// strict even across per-key spawns.
 type AntigravityAcpPool struct {
-	mu          sync.Mutex
-	workers     map[string]*AntigravityAcpWorker
-	spawning    map[string]chan struct{}
-	waitQueues  map[string][]chan *AntigravityAcpWorker
-	maxWorkers  int
+	mu         sync.Mutex
+	workers    map[string][]*AntigravityAcpWorker
+	spawning   map[string]chan struct{}
+	waitQueues map[string][]chan *AntigravityAcpWorker
+	// maxWorkers caps workers per auth key (per-key map growth bound).
+	maxWorkers int
+	// maxTotal caps the sum of workers across all keys. Zero means no
+	// additional global bound beyond maxWorkers.
+	maxTotal int
+	// spawnGate holds one token per admitted worker (capacity maxTotal).
+	// Spawning takes a token non-blockingly; a worker's removal returns it.
+	spawnGate chan struct{}
+	// slotFreed is broadcast (non-blocking send) whenever a global slot is
+	// returned, so globally-blocked waiters can retry their spawn attempt.
+	slotFreed   chan struct{}
 	idleTimeout time.Duration
 	closed      bool
 
@@ -65,7 +82,7 @@ func NewAntigravityAcpPool(maxWorkers int, idleTimeout time.Duration, factory fu
 		maxWorkers = 1
 	}
 	p := &AntigravityAcpPool{
-		workers:     make(map[string]*AntigravityAcpWorker),
+		workers:     make(map[string][]*AntigravityAcpWorker),
 		spawning:    make(map[string]chan struct{}),
 		waitQueues:  make(map[string][]chan *AntigravityAcpWorker),
 		maxWorkers:  maxWorkers,
@@ -78,8 +95,164 @@ func NewAntigravityAcpPool(maxWorkers int, idleTimeout time.Duration, factory fu
 	return p
 }
 
+// NewAntigravityAcpPoolWithLimits creates a pool with a per-auth cap and a
+// strict global cap. maxTotal <= 0 falls back to plain per-auth capping.
+func NewAntigravityAcpPoolWithLimits(maxWorkersPerAuth, maxTotal int, idleTimeout time.Duration, factory func(ctx context.Context, key string) (*acp.Client, error)) *AntigravityAcpPool {
+	if maxTotal <= 0 {
+		return NewAntigravityAcpPool(maxWorkersPerAuth, idleTimeout, factory)
+	}
+	if maxWorkersPerAuth <= 0 {
+		maxWorkersPerAuth = 1
+	}
+	if maxTotal < maxWorkersPerAuth {
+		maxTotal = maxWorkersPerAuth
+	}
+	p := NewAntigravityAcpPool(maxWorkersPerAuth, idleTimeout, factory)
+	p.maxTotal = maxTotal
+	p.spawnGate = make(chan struct{}, maxTotal)
+	p.slotFreed = make(chan struct{}, 1)
+	return p
+}
+
+// notifySlotFreed signals globally-blocked waiters that a slot came back.
+// Callers must hold p.mu; the signal itself is a non-blocking broadcast.
+func (p *AntigravityAcpPool) notifySlotFreed() {
+	if p.slotFreed == nil {
+		return
+	}
+	select {
+	case p.slotFreed <- struct{}{}:
+	default:
+	}
+}
+
+// totalWorkersLocked sums live workers across all keys. Callers must hold p.mu.
+func (p *AntigravityAcpPool) totalWorkersLocked() int {
+	total := 0
+	for _, ws := range p.workers {
+		total += len(ws)
+	}
+	return total
+}
+
+// globalSlotTryAcquire takes one global spawn slot without blocking. Callers
+// must hold p.mu. Always false when no global cap is configured.
+func (p *AntigravityAcpPool) globalSlotTryAcquire() bool {
+	if p.maxTotal <= 0 {
+		return true
+	}
+	select {
+	case p.spawnGate <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+// globalSlotReleaseLocked returns one global spawn slot. Callers must hold p.mu.
+func (p *AntigravityAcpPool) globalSlotReleaseLocked() {
+	if p.maxTotal <= 0 {
+		return
+	}
+	select {
+	case <-p.spawnGate:
+	default:
+	}
+	p.notifySlotFreed()
+}
+
+// removeWorkerLocked removes a worker from its per-key slice, reporting
+// whether it was present. Callers must hold p.mu.
+func (p *AntigravityAcpPool) removeWorkerLocked(w *AntigravityAcpWorker) bool {
+	ws, ok := p.workers[w.key]
+	if !ok {
+		return false
+	}
+	for i, cand := range ws {
+		if cand == w {
+			rest := append(ws[:i], ws[i+1:]...)
+			if len(rest) == 0 {
+				delete(p.workers, w.key)
+			} else {
+				p.workers[w.key] = rest
+			}
+			return true
+		}
+	}
+	return false
+}
+
+// closeClientAsync closes a client on a goroutine so pool locks are never
+// held across blocking stdio shutdowns.
+func closeClientAsync(c *acp.Client) {
+	if c == nil {
+		return
+	}
+	go func() { _ = c.Close() }()
+}
+
+// pruneDeadLocked removes dead workers of a key and closes their clients.
+// It replaces the per-key slice wholesale; every removed worker returns its
+// global slot. Callers must hold p.mu.
+func (p *AntigravityAcpPool) pruneDeadLocked(key string) {
+	ws := p.workers[key]
+	live := make([]*AntigravityAcpWorker, 0, len(ws))
+	for _, w := range ws {
+		w.mu.Lock()
+		dead := w.dead
+		w.mu.Unlock()
+		if dead {
+			p.globalSlotReleaseLocked()
+			closeClientAsync(w.client)
+			continue
+		}
+		live = append(live, w)
+	}
+	if len(live) != len(ws) {
+		if len(live) == 0 {
+			delete(p.workers, key)
+		} else {
+			p.workers[key] = live
+		}
+	}
+}
+
+// evictOldestIdleFromOtherKeys frees one global slot by removing the oldest
+// idle worker that belongs to a different key. Callers must hold p.mu.
+func (p *AntigravityAcpPool) evictOldestIdleFromOtherKeys(key string) {
+	if p.maxTotal <= 0 {
+		return
+	}
+	var victim *AntigravityAcpWorker
+	var oldest time.Time
+	for k, ws := range p.workers {
+		if k == key {
+			continue
+		}
+		for _, cand := range ws {
+			cand.mu.Lock()
+			idle := !cand.inUse && !cand.dead
+			last := cand.lastUsedAt
+			cand.mu.Unlock()
+			if idle && (victim == nil || last.Before(oldest)) {
+				victim = cand
+				oldest = last
+			}
+		}
+	}
+	if victim == nil {
+		return
+	}
+	if p.removeWorkerLocked(victim) {
+		p.globalSlotReleaseLocked()
+	}
+	closeClientAsync(victim.client)
+}
+
 // Acquire gets an exclusive lease on an active worker for the given key/identity.
-// If an existing worker is idle, it is reused. If busy, callers wait on a queue bound by ctx.
+// It reuses any idle worker of the auth key; when all matching workers are busy
+// and capacity remains, a fresh worker is spawned; otherwise the caller waits
+// on a per-key queue bound by ctx.
 func (p *AntigravityAcpPool) Acquire(ctx context.Context, key string, spawnFn func(ctx context.Context) (*acp.Client, error)) (*AntigravityAcpWorker, error) {
 	if p == nil {
 		return nil, fmt.Errorf("acp pool is nil")
@@ -107,11 +280,10 @@ func (p *AntigravityAcpPool) Acquire(ctx context.Context, key string, spawnFn fu
 			}
 		}
 
-		// 2. Check if a worker exists for this key
-		w, exists := p.workers[key]
-		if exists && !w.dead {
+		// 2. Reuse an idle worker for this key when one exists.
+		for _, w := range p.workers[key] {
 			w.mu.Lock()
-			if !w.inUse && !w.dead {
+			if !w.dead && !w.inUse {
 				// Re-check ctx before giving out the lease
 				if err := ctx.Err(); err != nil {
 					w.mu.Unlock()
@@ -125,137 +297,131 @@ func (p *AntigravityAcpPool) Acquire(ctx context.Context, key string, spawnFn fu
 				return w, nil
 			}
 			w.mu.Unlock()
+		}
 
-			// Worker is busy, join the wait queue for this key
-			waitCh := make(chan *AntigravityAcpWorker, 1)
-			p.waitQueues[key] = append(p.waitQueues[key], waitCh)
-			p.mu.Unlock()
-
-			select {
-			case <-ctx.Done():
-				p.mu.Lock()
-				q := p.waitQueues[key]
-				for i, ch := range q {
-					if ch == waitCh {
-						p.waitQueues[key] = append(q[:i], q[i+1:]...)
-						break
-					}
-				}
+		// 3. All matching workers are busy (or none exist). Spawn a fresh one
+		// when per-auth capacity remains and the strict global cap allows it.
+		p.pruneDeadLocked(key)
+		if len(p.workers[key]) < p.maxWorkers {
+			// Take exactly one global slot for the whole spawn attempt. When
+			// the cap is full, try to free one by evicting the oldest idle
+			// worker from another key, then take the slot once.
+			spawnOK := false
+			if p.globalSlotTryAcquire() {
+				spawnOK = true
+			} else {
+				p.evictOldestIdleFromOtherKeys(key)
+				spawnOK = p.globalSlotTryAcquire()
+			}
+			if spawnOK {
+				// Set spawning barrier for this key
+				spawnCh := make(chan struct{})
+				p.spawning[key] = spawnCh
 				p.mu.Unlock()
-				return nil, ctx.Err()
-			case worker, ok := <-waitCh:
-				if !ok || worker == nil {
-					// Woken up because worker died or pool was closed, loop to retry acquire or observe closure
-					continue
+
+				// Launch the worker outside of lock
+				client, err := p.launchSpawn(ctx, key, spawnFn)
+
+				p.mu.Lock()
+				delete(p.spawning, key)
+				close(spawnCh)
+
+				if err != nil {
+					p.globalSlotReleaseLocked()
+					p.mu.Unlock()
+					return nil, err
 				}
+
+				if p.closed {
+					p.globalSlotReleaseLocked()
+					p.mu.Unlock()
+					closeClientAsync(client)
+					return nil, fmt.Errorf("acp pool is closed")
+				}
+
+				if err := ctx.Err(); err != nil {
+					// Caller canceled during spawn. Save the fresh worker as
+					// idle so other waiters/callers can use it. The worker
+					// owns its global slot from here on.
+					worker := &AntigravityAcpWorker{
+						pool:       p,
+						key:        key,
+						client:     client,
+						createdAt:  time.Now(),
+						lastUsedAt: time.Now(),
+						inUse:      false,
+					}
+					p.workers[key] = append(p.workers[key], worker)
+					// Handoff to any waiter immediately
+					if q := p.waitQueues[key]; len(q) > 0 {
+						next := q[0]
+						p.waitQueues[key] = q[1:]
+						worker.inUse = true
+						next <- worker
+					}
+					p.mu.Unlock()
+					return nil, err
+				}
+
+				worker := &AntigravityAcpWorker{
+					pool:       p,
+					key:        key,
+					client:     client,
+					createdAt:  time.Now(),
+					lastUsedAt: time.Now(),
+					inUse:      true,
+				}
+				p.workers[key] = append(p.workers[key], worker)
+				p.mu.Unlock()
+
 				return worker, nil
 			}
 		}
 
-		// If a dead worker was present, remove and close it
-		if exists && w.dead {
-			delete(p.workers, key)
-			go func(oldClient *acp.Client) {
-				if oldClient != nil {
-					_ = oldClient.Close()
-				}
-			}(w.client)
+		// 4. Capacity exhausted for this key (or globally): join the per-key
+		// wait queue. Release hands a worker back or wakes us to retry.
+		waitCh := make(chan *AntigravityAcpWorker, 1)
+		p.waitQueues[key] = append(p.waitQueues[key], waitCh)
+		var slotFreed <-chan struct{}
+		if p.maxTotal > 0 {
+			slotFreed = p.slotFreed
 		}
-
-		// 3. If we are at capacity across all keys, clean up idle workers from other keys
-		if len(p.workers) >= p.maxWorkers {
-			var evictedKey string
-			var evictedWorker *AntigravityAcpWorker
-			var oldestIdle time.Time
-
-			for k, cand := range p.workers {
-				cand.mu.Lock()
-				if !cand.inUse {
-					if evictedWorker == nil || cand.lastUsedAt.Before(oldestIdle) {
-						evictedKey = k
-						evictedWorker = cand
-						oldestIdle = cand.lastUsedAt
-					}
-				}
-				cand.mu.Unlock()
-			}
-
-			if evictedWorker != nil {
-				delete(p.workers, evictedKey)
-				go func(c *acp.Client) {
-					if c != nil {
-						_ = c.Close()
-					}
-				}(evictedWorker.client)
-			}
-		}
-
-		// Set spawning barrier for this key
-		spawnCh := make(chan struct{})
-		p.spawning[key] = spawnCh
 		p.mu.Unlock()
 
-		// Launch the worker outside of lock
-		var client *acp.Client
-		var err error
-		if spawnFn != nil {
-			client, err = spawnFn(ctx)
-		} else if p.Factory != nil {
-			client, err = p.Factory(ctx, key)
-		} else {
-			err = fmt.Errorf("acp pool factory is nil")
-		}
-
-		p.mu.Lock()
-		delete(p.spawning, key)
-		close(spawnCh)
-
-		if err != nil {
-			p.mu.Unlock()
-			return nil, err
-		}
-
-		if p.closed {
-			p.mu.Unlock()
-			_ = client.Close()
-			return nil, fmt.Errorf("acp pool is closed")
-		}
-
-		if err := ctx.Err(); err != nil {
-			// Caller canceled during spawn. Save the fresh worker as idle so other waiters/callers can use it.
-			worker := &AntigravityAcpWorker{
-				pool:       p,
-				key:        key,
-				client:     client,
-				createdAt:  time.Now(),
-				lastUsedAt: time.Now(),
-				inUse:      false,
-			}
-			p.workers[key] = worker
-			// Handoff to any waiter immediately
-			if q := p.waitQueues[key]; len(q) > 0 {
-				next := q[0]
-				p.waitQueues[key] = q[1:]
-				worker.inUse = true
-				next <- worker
+		select {
+		case <-ctx.Done():
+			p.mu.Lock()
+			q := p.waitQueues[key]
+			for i, ch := range q {
+				if ch == waitCh {
+					p.waitQueues[key] = append(q[:i], q[i+1:]...)
+					break
+				}
 			}
 			p.mu.Unlock()
-			return nil, err
+			return nil, ctx.Err()
+		case worker, ok := <-waitCh:
+			if !ok || worker == nil {
+				// Woken up because a worker died or pool was closed, loop to retry acquire or observe closure
+				continue
+			}
+			return worker, nil
+		case <-slotFreed:
+			// A global slot may have come back: retry the whole acquire loop.
+			continue
 		}
-
-		worker := &AntigravityAcpWorker{
-			pool:       p,
-			key:        key,
-			client:     client,
-			createdAt:  time.Now(),
-			lastUsedAt: time.Now(),
-			inUse:      true,
-		}
-		p.workers[key] = worker
-		p.mu.Unlock()
-
-		return worker, nil
 	}
+}
+
+// launchSpawn resolves the spawn function and builds the client.
+func (p *AntigravityAcpPool) launchSpawn(ctx context.Context, key string, spawnFn func(ctx context.Context) (*acp.Client, error)) (*acp.Client, error) {
+	if spawnFn != nil {
+		return spawnFn(ctx)
+	}
+	if p.Factory != nil {
+		return p.Factory(ctx, key)
+	}
+	return nil, fmt.Errorf("acp pool factory is nil")
 }
 
 // Release returns the worker to the pool or hands it off to the next waiting caller.
@@ -277,14 +443,12 @@ func (p *AntigravityAcpPool) Release(worker *AntigravityAcpWorker, healthy bool)
 	defer p.mu.Unlock()
 
 	if p.closed || isDead {
-		if cur, ok := p.workers[worker.key]; ok && cur == worker {
-			delete(p.workers, worker.key)
+		// Remove from the pool and reclaim the global slot exactly once,
+		// tied to actual map membership so double releases stay harmless.
+		if p.removeWorkerLocked(worker) {
+			p.globalSlotReleaseLocked()
 		}
-		go func(c *acp.Client) {
-			if c != nil {
-				_ = c.Close()
-			}
-		}(worker.client)
+		closeClientAsync(worker.client)
 
 		// If there are waiters for this key and worker died, wake all up to re-acquire / spawn fresh worker
 		if q := p.waitQueues[worker.key]; len(q) > 0 {
@@ -306,6 +470,24 @@ func (p *AntigravityAcpPool) Release(worker *AntigravityAcpWorker, healthy bool)
 		worker.mu.Unlock()
 		next <- worker
 		return
+	}
+
+	// Under a global cap with no same-key waiter, an idle worker of this key
+	// starves other keys: the cap stays full and cross-key waiters only wake
+	// on slot removal. Evict this now-idle worker (returning its slot) so a
+	// blocked other-key acquirer can spawn; it will be recreated on demand.
+	if p.maxTotal > 0 && p.totalWorkersLocked() >= p.maxTotal {
+		hasOtherWaiters := false
+		for k, q := range p.waitQueues {
+			if k != worker.key && len(q) > 0 {
+				hasOtherWaiters = true
+				break
+			}
+		}
+		if hasOtherWaiters && p.removeWorkerLocked(worker) {
+			p.globalSlotReleaseLocked()
+			closeClientAsync(worker.client)
+		}
 	}
 }
 
@@ -329,12 +511,18 @@ func (p *AntigravityAcpPool) Close() error {
 		delete(p.waitQueues, k)
 	}
 
-	workersToClose := make([]*acp.Client, 0, len(p.workers))
-	for k, w := range p.workers {
-		if w != nil && w.client != nil {
-			workersToClose = append(workersToClose, w.client)
+	workersToClose := make([]*acp.Client, 0, p.totalWorkersLocked())
+	for k, ws := range p.workers {
+		for _, w := range ws {
+			if w != nil && w.client != nil {
+				workersToClose = append(workersToClose, w.client)
+			}
 		}
 		delete(p.workers, k)
+	}
+	if p.maxTotal > 0 {
+		// All slots are reclaimed at once; the pool never admits again.
+		p.globalSlotReleaseLockedAll()
 	}
 	p.mu.Unlock()
 
@@ -342,6 +530,22 @@ func (p *AntigravityAcpPool) Close() error {
 		_ = c.Close()
 	}
 	return nil
+}
+
+// globalSlotReleaseLockedAll drains every global slot token. Callers must hold p.mu.
+func (p *AntigravityAcpPool) globalSlotReleaseLockedAll() {
+	if p.maxTotal <= 0 {
+		return
+	}
+	for {
+		select {
+		case <-p.spawnGate:
+			continue
+		default:
+		}
+		break
+	}
+	p.notifySlotFreed()
 }
 
 func (p *AntigravityAcpPool) idleCleanupLoop() {
@@ -360,20 +564,34 @@ func (p *AntigravityAcpPool) idleCleanupLoop() {
 		}
 
 		now := time.Now()
-		for k, w := range p.workers {
-			w.mu.Lock()
-			if !w.inUse && now.Sub(w.lastUsedAt) > p.idleTimeout {
-				w.dead = true
-				delete(p.workers, k)
+		for k, ws := range p.workers {
+			live := make([]*AntigravityAcpWorker, 0, len(ws))
+			for _, w := range ws {
+				w.mu.Lock()
+				expired := !w.inUse && now.Sub(w.lastUsedAt) > p.idleTimeout
+				if expired {
+					w.dead = true
+				}
 				w.mu.Unlock()
-				go func(c *acp.Client) {
-					if c != nil {
-						log.Infof("ACP persistent worker for %s idle-timed out; closing", k)
-						_ = c.Close()
-					}
-				}(w.client)
-			} else {
-				w.mu.Unlock()
+				if expired {
+					p.globalSlotReleaseLocked()
+					client := w.client
+					go func(key string, c *acp.Client) {
+						log.Infof("ACP persistent worker for %s idle-timed out; closing", key)
+						if c != nil {
+							_ = c.Close()
+						}
+					}(k, client)
+					continue
+				}
+				live = append(live, w)
+			}
+			if len(live) != len(ws) {
+				if len(live) == 0 {
+					delete(p.workers, k)
+				} else {
+					p.workers[k] = live
+				}
 			}
 		}
 		p.mu.Unlock()
