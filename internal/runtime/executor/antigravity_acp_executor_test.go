@@ -208,24 +208,22 @@ func TestAntigravityAcpExecutorExecuteStream(t *testing.T) {
 		if c == "data: [DONE]\n\n" {
 			hasDone = true
 		}
-		if len(c) > 0 && c != "data: [DONE]\n\n" {
-			if len(c) > 6 && c[:6] == "data: " {
-				var delta struct {
-					Choices []struct {
-						Delta struct {
-							Content          string `json:"content"`
-							ReasoningContent string `json:"reasoning_content"`
-						} `json:"delta"`
-					} `json:"choices"`
+		if len(c) > 0 {
+			var delta struct {
+				Choices []struct {
+					Delta struct {
+						Content          string `json:"content"`
+						ReasoningContent string `json:"reasoning_content"`
+					} `json:"delta"`
+				} `json:"choices"`
+			}
+			_ = json.Unmarshal([]byte(c), &delta)
+			if len(delta.Choices) > 0 {
+				if delta.Choices[0].Delta.Content == "hello from acp" {
+					hasMessage = true
 				}
-				_ = json.Unmarshal([]byte(c[6:]), &delta)
-				if len(delta.Choices) > 0 {
-					if delta.Choices[0].Delta.Content == "hello from acp" {
-						hasMessage = true
-					}
-					if delta.Choices[0].Delta.ReasoningContent == "thinking step" {
-						hasThought = true
-					}
+				if delta.Choices[0].Delta.ReasoningContent == "thinking step" {
+					hasThought = true
 				}
 			}
 		}

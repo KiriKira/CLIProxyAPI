@@ -1303,8 +1303,8 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 					} `json:"content"`
 				}
 				if err := json.Unmarshal(u.Raw, &chunk); err == nil && chunk.Content.Text != "" {
-					ssePayload := fmt.Sprintf("data: {\"choices\":[{\"delta\":{\"content\":%s}}]}\n\n", string(mustMarshal(chunk.Content.Text)))
-					emitChunk([]byte(ssePayload))
+					rawJSON := fmt.Sprintf("{\"choices\":[{\"delta\":{\"content\":%s}}]}", string(mustMarshal(chunk.Content.Text)))
+					emitChunk([]byte(rawJSON))
 				}
 			case "agent_thought_chunk":
 				var chunk struct {
@@ -1313,8 +1313,8 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 					} `json:"content"`
 				}
 				if err := json.Unmarshal(u.Raw, &chunk); err == nil && chunk.Content.Text != "" {
-					ssePayload := fmt.Sprintf("data: {\"choices\":[{\"delta\":{\"reasoning_content\":%s}}]}\n\n", string(mustMarshal(chunk.Content.Text)))
-					emitChunk([]byte(ssePayload))
+					rawJSON := fmt.Sprintf("{\"choices\":[{\"delta\":{\"reasoning_content\":%s}}]}", string(mustMarshal(chunk.Content.Text)))
+					emitChunk([]byte(rawJSON))
 				}
 			}
 		})
