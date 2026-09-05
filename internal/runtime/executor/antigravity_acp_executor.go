@@ -1167,6 +1167,17 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 		return resp, err
 	}
 	defer cleanupAttachments()
+
+	promptDone := make(chan struct{})
+	defer close(promptDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = client.Cancel(sessionID)
+		case <-promptDone:
+		}
+	}()
+
 	stopReason, err := client.Prompt(ctx, sessionID, blocks)
 	if err != nil {
 		if acp.IsTransportError(err) {
@@ -1316,6 +1327,17 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 			return
 		}
 		defer cleanupAttachments()
+
+		promptDone := make(chan struct{})
+		defer close(promptDone)
+		go func() {
+			select {
+			case <-ctx.Done():
+				_ = client.Cancel(sessionID)
+			case <-promptDone:
+			}
+		}()
+
 		_, promptErr := client.Prompt(ctx, sessionID, blocks)
 		if promptErr != nil {
 			if acp.IsTransportError(promptErr) {

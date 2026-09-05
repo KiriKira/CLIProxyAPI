@@ -49,6 +49,7 @@ func (w *AntigravityAcpWorker) MarkDead(err error) {
 type AntigravityAcpPool struct {
 	mu          sync.Mutex
 	workers     map[string]*AntigravityAcpWorker
+	spawning    map[string]chan struct{}
 	waitQueues  map[string][]chan *AntigravityAcpWorker
 	maxWorkers  int
 	idleTimeout time.Duration
@@ -65,6 +66,7 @@ func NewAntigravityAcpPool(maxWorkers int, idleTimeout time.Duration, factory fu
 	}
 	p := &AntigravityAcpPool{
 		workers:     make(map[string]*AntigravityAcpWorker),
+		spawning:    make(map[string]chan struct{}),
 		waitQueues:  make(map[string][]chan *AntigravityAcpWorker),
 		maxWorkers:  maxWorkers,
 		idleTimeout: idleTimeout,
@@ -82,125 +84,178 @@ func (p *AntigravityAcpPool) Acquire(ctx context.Context, key string, spawnFn fu
 	if p == nil {
 		return nil, fmt.Errorf("acp pool is nil")
 	}
-
-	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
-		return nil, fmt.Errorf("acp pool is closed")
-	}
-
-	// Check if a worker exists for this key
-	w, exists := p.workers[key]
-	if exists && !w.dead {
-		w.mu.Lock()
-		if !w.inUse && !w.dead {
-			w.inUse = true
-			w.lastUsedAt = time.Now()
-			w.mu.Unlock()
-			p.mu.Unlock()
-			return w, nil
-		}
-		w.mu.Unlock()
-
-		// Worker is busy, join the wait queue for this key
-		waitCh := make(chan *AntigravityAcpWorker, 1)
-		p.waitQueues[key] = append(p.waitQueues[key], waitCh)
-		p.mu.Unlock()
-
-		select {
-		case <-ctx.Done():
-			p.mu.Lock()
-			// Remove from waitQueue
-			q := p.waitQueues[key]
-			for i, ch := range q {
-				if ch == waitCh {
-					p.waitQueues[key] = append(q[:i], q[i+1:]...)
-					break
-				}
-			}
-			p.mu.Unlock()
-			return nil, ctx.Err()
-		case worker, ok := <-waitCh:
-			if !ok || worker == nil {
-				return nil, fmt.Errorf("acp pool closed or wait canceled")
-			}
-			return worker, nil
-		}
-	}
-
-	// If a dead worker was present, remove and close it
-	if exists && w.dead {
-		delete(p.workers, key)
-		go func(oldClient *acp.Client) {
-			if oldClient != nil {
-				_ = oldClient.Close()
-			}
-		}(w.client)
-	}
-
-	// If we are at capacity across all keys, clean up idle workers from other keys
-	if len(p.workers) >= p.maxWorkers {
-		var evictedKey string
-		var evictedWorker *AntigravityAcpWorker
-		var oldestIdle time.Time
-
-		for k, cand := range p.workers {
-			cand.mu.Lock()
-			if !cand.inUse {
-				if evictedWorker == nil || cand.lastUsedAt.Before(oldestIdle) {
-					evictedKey = k
-					evictedWorker = cand
-					oldestIdle = cand.lastUsedAt
-				}
-			}
-			cand.mu.Unlock()
-		}
-
-		if evictedWorker != nil {
-			delete(p.workers, evictedKey)
-			go func(c *acp.Client) {
-				if c != nil {
-					_ = c.Close()
-				}
-			}(evictedWorker.client)
-		}
-	}
-
-	p.mu.Unlock()
-
-	var client *acp.Client
-	var err error
-	if spawnFn != nil {
-		client, err = spawnFn(ctx)
-	} else if p.Factory != nil {
-		client, err = p.Factory(ctx, key)
-	} else {
-		return nil, fmt.Errorf("acp pool factory is nil")
-	}
-
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
-	worker := &AntigravityAcpWorker{
-		pool:       p,
-		key:        key,
-		client:     client,
-		createdAt:  time.Now(),
-		lastUsedAt: time.Now(),
-		inUse:      true,
-	}
+	for {
+		p.mu.Lock()
+		if p.closed {
+			p.mu.Unlock()
+			return nil, fmt.Errorf("acp pool is closed")
+		}
 
-	p.mu.Lock()
-	if p.closed {
+		// 1. If another goroutine is currently spawning a worker for this key, wait on barrier
+		if spawnCh, isSpawning := p.spawning[key]; isSpawning {
+			p.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-spawnCh:
+				// Spawning finished (or failed), re-check in next iteration
+				continue
+			}
+		}
+
+		// 2. Check if a worker exists for this key
+		w, exists := p.workers[key]
+		if exists && !w.dead {
+			w.mu.Lock()
+			if !w.inUse && !w.dead {
+				// Re-check ctx before giving out the lease
+				if err := ctx.Err(); err != nil {
+					w.mu.Unlock()
+					p.mu.Unlock()
+					return nil, err
+				}
+				w.inUse = true
+				w.lastUsedAt = time.Now()
+				w.mu.Unlock()
+				p.mu.Unlock()
+				return w, nil
+			}
+			w.mu.Unlock()
+
+			// Worker is busy, join the wait queue for this key
+			waitCh := make(chan *AntigravityAcpWorker, 1)
+			p.waitQueues[key] = append(p.waitQueues[key], waitCh)
+			p.mu.Unlock()
+
+			select {
+			case <-ctx.Done():
+				p.mu.Lock()
+				q := p.waitQueues[key]
+				for i, ch := range q {
+					if ch == waitCh {
+						p.waitQueues[key] = append(q[:i], q[i+1:]...)
+						break
+					}
+				}
+				p.mu.Unlock()
+				return nil, ctx.Err()
+			case worker, ok := <-waitCh:
+				if !ok || worker == nil {
+					// Woken up because worker died or pool was closed, loop to retry acquire or observe closure
+					continue
+				}
+				return worker, nil
+			}
+		}
+
+		// If a dead worker was present, remove and close it
+		if exists && w.dead {
+			delete(p.workers, key)
+			go func(oldClient *acp.Client) {
+				if oldClient != nil {
+					_ = oldClient.Close()
+				}
+			}(w.client)
+		}
+
+		// 3. If we are at capacity across all keys, clean up idle workers from other keys
+		if len(p.workers) >= p.maxWorkers {
+			var evictedKey string
+			var evictedWorker *AntigravityAcpWorker
+			var oldestIdle time.Time
+
+			for k, cand := range p.workers {
+				cand.mu.Lock()
+				if !cand.inUse {
+					if evictedWorker == nil || cand.lastUsedAt.Before(oldestIdle) {
+						evictedKey = k
+						evictedWorker = cand
+						oldestIdle = cand.lastUsedAt
+					}
+				}
+				cand.mu.Unlock()
+			}
+
+			if evictedWorker != nil {
+				delete(p.workers, evictedKey)
+				go func(c *acp.Client) {
+					if c != nil {
+						_ = c.Close()
+					}
+				}(evictedWorker.client)
+			}
+		}
+
+		// Set spawning barrier for this key
+		spawnCh := make(chan struct{})
+		p.spawning[key] = spawnCh
 		p.mu.Unlock()
-		_ = client.Close()
-		return nil, fmt.Errorf("acp pool is closed")
-	}
-	p.workers[key] = worker
-	p.mu.Unlock()
 
-	return worker, nil
+		// Launch the worker outside of lock
+		var client *acp.Client
+		var err error
+		if spawnFn != nil {
+			client, err = spawnFn(ctx)
+		} else if p.Factory != nil {
+			client, err = p.Factory(ctx, key)
+		} else {
+			err = fmt.Errorf("acp pool factory is nil")
+		}
+
+		p.mu.Lock()
+		delete(p.spawning, key)
+		close(spawnCh)
+
+		if err != nil {
+			p.mu.Unlock()
+			return nil, err
+		}
+
+		if p.closed {
+			p.mu.Unlock()
+			_ = client.Close()
+			return nil, fmt.Errorf("acp pool is closed")
+		}
+
+		if err := ctx.Err(); err != nil {
+			// Caller canceled during spawn. Save the fresh worker as idle so other waiters/callers can use it.
+			worker := &AntigravityAcpWorker{
+				pool:       p,
+				key:        key,
+				client:     client,
+				createdAt:  time.Now(),
+				lastUsedAt: time.Now(),
+				inUse:      false,
+			}
+			p.workers[key] = worker
+			// Handoff to any waiter immediately
+			if q := p.waitQueues[key]; len(q) > 0 {
+				next := q[0]
+				p.waitQueues[key] = q[1:]
+				worker.inUse = true
+				next <- worker
+			}
+			p.mu.Unlock()
+			return nil, err
+		}
+
+		worker := &AntigravityAcpWorker{
+			pool:       p,
+			key:        key,
+			client:     client,
+			createdAt:  time.Now(),
+			lastUsedAt: time.Now(),
+			inUse:      true,
+		}
+		p.workers[key] = worker
+		p.mu.Unlock()
+
+		return worker, nil
+	}
 }
 
 // Release returns the worker to the pool or hands it off to the next waiting caller.
@@ -231,11 +286,12 @@ func (p *AntigravityAcpPool) Release(worker *AntigravityAcpWorker, healthy bool)
 			}
 		}(worker.client)
 
-		// If there are waiters for this key and worker died, wake one up so it can trigger a fresh spawn
+		// If there are waiters for this key and worker died, wake all up to re-acquire / spawn fresh worker
 		if q := p.waitQueues[worker.key]; len(q) > 0 {
-			next := q[0]
-			p.waitQueues[worker.key] = q[1:]
-			close(next) // Wakes up waiter to retry / observe closure
+			for _, ch := range q {
+				close(ch)
+			}
+			delete(p.waitQueues, worker.key)
 		}
 		return
 	}
