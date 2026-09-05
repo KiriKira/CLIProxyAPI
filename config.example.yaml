@@ -302,6 +302,9 @@ codex:
 #   auth-method: ""               # optional: oauth-personal (default), oauth-business, gemini-api-key, agent-platform
 #   gcp-project: ""               # optional: needed for oauth-business / agent-platform
 #   gcp-location: ""              # optional: needed for oauth-business / agent-platform
+#   persistent-process: true      # optional: keep daemon warm across requests (default: true)
+#   max-workers: 1                # optional: max persistent daemon worker processes (default: 1)
+#   idle-timeout: "0"             # optional: terminate idle persistent workers after duration (e.g. "10m", "1h"); "0" means stay warm
 
 # xAI provider behavior.
 xai:

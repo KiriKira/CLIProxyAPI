@@ -34,14 +34,48 @@ import (
 // AntigravityAcpExecutor bridges incoming OpenAI/Claude requests to the local
 // official Antigravity ACP stdio daemon.
 type AntigravityAcpExecutor struct {
-	cfg *internalconfig.Config
+	cfg  *internalconfig.Config
+	pool *helps.AntigravityAcpPool
+}
+
+func (e *AntigravityAcpExecutor) authPoolKey(auth *cliproxyauth.Auth) string {
+	method := e.resolveAuthMethod(auth)
+	profileDir := e.resolveProfileDir(auth)
+	binary, _ := e.resolveBinary(auth)
+	authID := ""
+	if auth != nil {
+		authID = auth.ID
+	}
+	return fmt.Sprintf("%s|%s|%s|%s", authID, method, profileDir, binary)
 }
 
 // NewAntigravityAcpExecutor creates a new ACP executor instance.
 func NewAntigravityAcpExecutor(cfg *internalconfig.Config) *AntigravityAcpExecutor {
-	return &AntigravityAcpExecutor{
+	exec := &AntigravityAcpExecutor{
 		cfg: cfg,
 	}
+
+	persistent := true
+	maxWorkers := 1
+	var idleTimeout time.Duration
+
+	if cfg != nil {
+		if cfg.Antigravity.PersistentProcess != nil {
+			persistent = *cfg.Antigravity.PersistentProcess
+		}
+		if cfg.Antigravity.MaxWorkers > 0 {
+			maxWorkers = cfg.Antigravity.MaxWorkers
+		}
+		if d, err := time.ParseDuration(cfg.Antigravity.IdleTimeout); err == nil && d > 0 {
+			idleTimeout = d
+		}
+	}
+
+	if persistent {
+		exec.pool = helps.NewAntigravityAcpPool(maxWorkers, idleTimeout, nil)
+	}
+
+	return exec
 }
 
 // Identifier returns the provider identifier for this executor.
@@ -1058,14 +1092,40 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 		return resp, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
 	}
 
-	client, err := e.spawnClient(ctx, auth)
-	if err != nil {
-		return resp, err
+	var client *acp.Client
+	var worker *helps.AntigravityAcpWorker
+
+	if e.pool != nil {
+		key := e.authPoolKey(auth)
+		w, acqErr := e.pool.Acquire(ctx, key, func(spawnCtx context.Context) (*acp.Client, error) {
+			return e.spawnClient(spawnCtx, auth)
+		})
+		if acqErr != nil {
+			return resp, acqErr
+		}
+		worker = w
+		client = w.Client()
+	} else {
+		c, spawnErr := e.spawnClient(ctx, auth)
+		if spawnErr != nil {
+			return resp, spawnErr
+		}
+		client = c
+		defer client.Close()
 	}
-	defer client.Close()
+
+	healthy := true
+	defer func() {
+		if worker != nil {
+			e.pool.Release(worker, healthy)
+		}
+	}()
 
 	sessionID, err := openSession(ctx, client, req.Model, req.Payload)
 	if err != nil {
+		if acp.IsTransportError(err) {
+			healthy = false
+		}
 		return resp, err
 	}
 
@@ -1109,6 +1169,9 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 	defer cleanupAttachments()
 	stopReason, err := client.Prompt(ctx, sessionID, blocks)
 	if err != nil {
+		if acp.IsTransportError(err) {
+			healthy = false
+		}
 		return resp, statusErr{code: http.StatusInternalServerError, msg: fmt.Sprintf("ACP prompt error: %v", err)}
 	}
 
@@ -1157,14 +1220,34 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 		return nil, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
 	}
 
-	client, err := e.spawnClient(ctx, auth)
-	if err != nil {
-		return nil, err
+	var client *acp.Client
+	var worker *helps.AntigravityAcpWorker
+
+	if e.pool != nil {
+		key := e.authPoolKey(auth)
+		w, acqErr := e.pool.Acquire(ctx, key, func(spawnCtx context.Context) (*acp.Client, error) {
+			return e.spawnClient(spawnCtx, auth)
+		})
+		if acqErr != nil {
+			return nil, acqErr
+		}
+		worker = w
+		client = w.Client()
+	} else {
+		c, spawnErr := e.spawnClient(ctx, auth)
+		if spawnErr != nil {
+			return nil, spawnErr
+		}
+		client = c
 	}
 
 	sessionID, err := openSession(ctx, client, req.Model, req.Payload)
 	if err != nil {
-		client.Close()
+		if worker != nil {
+			e.pool.Release(worker, !acp.IsTransportError(err))
+		} else {
+			client.Close()
+		}
 		return nil, err
 	}
 
@@ -1186,8 +1269,15 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 	}
 
 	go func() {
-		defer client.Close()
-		defer close(chunkChan)
+		healthy := true
+		defer func() {
+			if worker != nil {
+				e.pool.Release(worker, healthy)
+			} else {
+				client.Close()
+			}
+			close(chunkChan)
+		}()
 
 		client.OnUpdate(func(u acp.SessionUpdate) {
 			if u.SessionID != sessionID {
@@ -1228,6 +1318,9 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 		defer cleanupAttachments()
 		_, promptErr := client.Prompt(ctx, sessionID, blocks)
 		if promptErr != nil {
+			if acp.IsTransportError(promptErr) {
+				healthy = false
+			}
 			log.Errorf("ACP prompt stream error: %v", promptErr)
 			chunkChan <- cliproxyexecutor.StreamChunk{
 				Err: promptErr,

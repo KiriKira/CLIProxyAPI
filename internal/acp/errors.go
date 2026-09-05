@@ -45,3 +45,12 @@ func IsSignInRequired(err error) bool {
 	}
 	return rpcErr.Code == signInRequiredCode
 }
+
+// IsTransportError reports whether err is a local transport or process-level error.
+func IsTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var tErr *TransportError
+	return errors.As(err, &tErr)
+}

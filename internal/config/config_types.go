@@ -150,6 +150,18 @@ type AntigravityConfig struct {
 	// the agent profile settings. Never hold credentials.
 	GcpProject  string `yaml:"gcp-project,omitempty" json:"gcp-project,omitempty"`
 	GcpLocation string `yaml:"gcp-location,omitempty" json:"gcp-location,omitempty"`
+
+	// PersistentProcess controls whether the ACP daemon runs as a persistent worker
+	// across requests instead of spawning and terminating a new process per request.
+	// Default: true. Set to false to force per-request cold spawn (legacy mode).
+	PersistentProcess *bool `yaml:"persistent-process,omitempty" json:"persistent-process,omitempty"`
+	// MaxWorkers is the maximum number of persistent daemon worker processes.
+	// Default: 1 (recommended for low-memory VPS environments like 512MB RAM).
+	MaxWorkers int `yaml:"max-workers,omitempty" json:"max-workers,omitempty"`
+	// IdleTimeout is the duration after which an idle persistent worker process is
+	// terminated to reclaim system memory. Empty or "0" disables idle termination (daemon stays warm).
+	// Example: "10m", "1h".
+	IdleTimeout string `yaml:"idle-timeout,omitempty" json:"idle-timeout,omitempty"`
 }
 
 // CodexConfig configures provider-wide Codex request behavior.

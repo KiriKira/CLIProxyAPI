@@ -186,6 +186,9 @@ func (c *Client) ExitErr() <-chan error { return c.exitCh }
 // failAllPending runs after closedMu is released so call() (which never
 // nests the two locks) cannot deadlock with Close().
 func (c *Client) Close() error {
+	if c == nil {
+		return nil
+	}
 	c.closedMu.Lock()
 	if c.closed {
 		err := c.closeErr
@@ -194,7 +197,10 @@ func (c *Client) Close() error {
 	}
 	c.closed = true
 	c.closedMu.Unlock()
-	err := c.stdin.close()
+	var err error
+	if c.stdin != nil {
+		err = c.stdin.close()
+	}
 	c.closedMu.Lock()
 	c.closeErr = err
 	c.closedMu.Unlock()

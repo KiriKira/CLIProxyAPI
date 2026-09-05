@@ -724,3 +724,57 @@ func TestBuildPromptBlocksClaudeImage(t *testing.T) {
 		t.Fatalf("unexpected blocks: %+v", blocks)
 	}
 }
+
+func TestAntigravityAcpExecutorPersistentWorkerReuse(t *testing.T) {
+	script := createFakeAgentScript(t)
+	geminiHome := t.TempDir()
+	cfg := &internalconfig.Config{}
+	exec := NewAntigravityAcpExecutor(cfg)
+
+	auth := &cliproxyauth.Auth{
+		ID: "test-auth-reuse",
+		Attributes: map[string]string{
+			"binary_path": script,
+			"gemini_home": geminiHome,
+		},
+	}
+
+	req := cliproxyexecutor.Request{
+		Model:   "gemini-3.8-flash",
+		Payload: []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+	}
+	opts := cliproxyexecutor.Options{}
+
+	ctx := context.Background()
+
+	// First execution
+	resp1, err := exec.Execute(ctx, auth, req, opts)
+	if err != nil {
+		t.Fatalf("Execute 1 failed: %v", err)
+	}
+	if len(resp1.Payload) == 0 {
+		t.Fatalf("expected non-empty payload in resp1")
+	}
+
+	// Second execution on same executor & auth should reuse the process
+	resp2, err := exec.Execute(ctx, auth, req, opts)
+	if err != nil {
+		t.Fatalf("Execute 2 failed: %v", err)
+	}
+	if len(resp2.Payload) == 0 {
+		t.Fatalf("expected non-empty payload in resp2")
+	}
+
+	// Fake agent logs methods to methods.log
+	got := methodsSeen(t, script)
+	// Should have initialized and authenticated once, but created session twice
+	want := []string{"initialize", "authenticate", "session/new", "session/prompt", "session/new", "session/prompt"}
+	if len(got) != len(want) {
+		t.Fatalf("methods = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("methods[%d] = %v, want %v", i, got[i], want[i])
+		}
+	}
+}
