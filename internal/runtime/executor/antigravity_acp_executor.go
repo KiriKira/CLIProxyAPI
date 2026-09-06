@@ -49,6 +49,12 @@ func (e *AntigravityAcpExecutor) authPoolKey(auth *cliproxyauth.Auth) string {
 	return fmt.Sprintf("%s|%s|%s|%s", authID, method, profileDir, binary)
 }
 
+// antigravityPreparedSessionsPerWorker bounds the ready-session cache kept
+// on each idle worker when prepared-sessions is enabled. One session per
+// worker covers the sequential-request pattern without pre-creating a
+// server-side session storm.
+const antigravityPreparedSessionsPerWorker = 1
+
 // NewAntigravityAcpExecutor creates a new ACP executor instance.
 func NewAntigravityAcpExecutor(cfg *internalconfig.Config) *AntigravityAcpExecutor {
 	exec := &AntigravityAcpExecutor{
@@ -58,6 +64,7 @@ func NewAntigravityAcpExecutor(cfg *internalconfig.Config) *AntigravityAcpExecut
 	persistent := true
 	maxWorkers := 1
 	var maxTotal int
+	prepareSessions := false
 	var idleTimeout time.Duration
 
 	if cfg != nil {
@@ -70,13 +77,20 @@ func NewAntigravityAcpExecutor(cfg *internalconfig.Config) *AntigravityAcpExecut
 		if cfg.Antigravity.MaxWorkersTotal > 0 {
 			maxTotal = cfg.Antigravity.MaxWorkersTotal
 		}
+		if cfg.Antigravity.PreparedSessions > 0 {
+			prepareSessions = true
+		}
 		if d, err := time.ParseDuration(cfg.Antigravity.IdleTimeout); err == nil && d > 0 {
 			idleTimeout = d
 		}
 	}
 
 	if persistent {
-		exec.pool = helps.NewAntigravityAcpPoolWithLimits(maxWorkers, maxTotal, idleTimeout, nil)
+		var prepareLimit int
+		if prepareSessions {
+			prepareLimit = antigravityPreparedSessionsPerWorker
+		}
+		exec.pool = helps.NewAntigravityAcpPoolWithLimits(maxWorkers, maxTotal, prepareLimit, idleTimeout, nil)
 	}
 
 	return exec
@@ -1070,13 +1084,29 @@ func buildPromptBlocks(payload []byte) (blocks []acp.PromptBlock, cleanup func()
 	return acp.NewTextPrompt(string(payload)), cleanup, nil
 }
 
-// openSession creates one isolated session and applies the requested model
-// variant. A rejected variant is a client error: the message carries the
-// daemon verdict so callers can pick an offered model. When the freshly
-// created session already selects the resolved variant, the redundant
-// session/set_config_option round trip is skipped — this removes one ACP
-// round trip from the warm-path critical section before session/prompt.
-func openSession(ctx context.Context, client *acp.Client, model string, payload []byte) (string, error) {
+// openSession binds a session for the request: it pops a pre-created
+// fresh session from the pool worker when available (skipping the
+// session/new round trip entirely), falling back to creating one now.
+// The requested model variant is applied only when the session's current
+// model differs, so the common warm path reaches session/prompt with zero
+// ACP round trips before it. A rejected variant is a client error: the
+// message carries the daemon verdict so callers can pick an offered model.
+func openSession(ctx context.Context, client *acp.Client, worker *helps.AntigravityAcpWorker, model string, payload []byte) (string, error) {
+	variant := resolveAntigravityModel(model, payload)
+
+	// Fast path: a prepared fresh session (never prompted, zero context).
+	if ps := worker.AcquirePreparedSession(); ps != nil {
+		sessionID := ps.SessionID
+		if variant == "" || acp.CurrentModel(client.ConfigOptions(sessionID)) == variant {
+			return sessionID, nil
+		}
+		if _, err := client.SetConfigOption(ctx, sessionID, "model", variant); err != nil {
+			return "", statusErr{code: http.StatusBadRequest, msg: fmt.Sprintf("Antigravity model %q unavailable: %v", variant, err)}
+		}
+		return sessionID, nil
+	}
+
+	// Slow path: create a session now.
 	cwd, _ := os.Getwd()
 	sessionID, err := client.NewSession(ctx, cwd)
 	if err != nil {
@@ -1085,7 +1115,6 @@ func openSession(ctx context.Context, client *acp.Client, model string, payload 
 		}
 		return "", statusErr{code: http.StatusBadGateway, msg: fmt.Sprintf("ACP session/new failed: %v", err)}
 	}
-	variant := resolveAntigravityModel(model, payload)
 	if variant == "" {
 		return sessionID, nil
 	}
@@ -1197,7 +1226,7 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 		promptCh <- promptResult{blocks, cleanupAttachments, buildErr}
 	}()
 
-	sessionID, err := openSession(ctx, client, req.Model, req.Payload)
+	sessionID, err := openSession(ctx, client, worker, req.Model, req.Payload)
 	if err != nil {
 		if acp.IsTransportError(err) {
 			healthy = false
@@ -1352,7 +1381,7 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 		promptCh <- promptResult{blocks, cleanupAttachments, buildErr}
 	}()
 
-	sessionID, err := openSession(ctx, client, req.Model, req.Payload)
+	sessionID, err := openSession(ctx, client, worker, req.Model, req.Payload)
 	if err != nil {
 		if worker != nil {
 			e.pool.Release(worker, !acp.IsTransportError(err))

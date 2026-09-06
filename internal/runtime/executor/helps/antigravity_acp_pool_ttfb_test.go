@@ -67,7 +67,7 @@ func TestAntigravityAcpPool_SameAuthSpawnsSecondWorkerWhenBusy(t *testing.T) {
 // even across different keys, and admits a waiting key after a slot frees up.
 func TestAntigravityAcpPool_GlobalCapStrict(t *testing.T) {
 	var spawnCount atomic.Int32
-	pool := NewAntigravityAcpPoolWithLimits(1, 2, 0, func(ctx context.Context, key string) (*acp.Client, error) {
+	pool := NewAntigravityAcpPoolWithLimits(1, 2, 0, 0, func(ctx context.Context, key string) (*acp.Client, error) {
 		spawnCount.Add(1)
 		return &acp.Client{}, nil
 	})
@@ -124,7 +124,7 @@ func TestAntigravityAcpPool_GlobalCapStrict(t *testing.T) {
 // admit the incoming key instead of leaving it queued forever.
 func TestAntigravityAcpPool_GlobalCapEvictsOldestIdleFromOtherKey(t *testing.T) {
 	var spawnCount atomic.Int32
-	pool := NewAntigravityAcpPoolWithLimits(1, 2, 0, func(ctx context.Context, key string) (*acp.Client, error) {
+	pool := NewAntigravityAcpPoolWithLimits(1, 2, 0, 0, func(ctx context.Context, key string) (*acp.Client, error) {
 		spawnCount.Add(1)
 		return &acp.Client{}, nil
 	})
@@ -168,7 +168,7 @@ func TestAntigravityAcpPool_GlobalCapEvictsOldestIdleFromOtherKey(t *testing.T) 
 // contract: a queued same-auth waiter receives the released worker directly.
 func TestAntigravityAcpPool_WaitQueueWakesOnHealthyHandoff(t *testing.T) {
 	var spawnCount atomic.Int32
-	pool := NewAntigravityAcpPoolWithLimits(1, 1, 0, func(ctx context.Context, key string) (*acp.Client, error) {
+	pool := NewAntigravityAcpPoolWithLimits(1, 1, 0, 0, func(ctx context.Context, key string) (*acp.Client, error) {
 		spawnCount.Add(1)
 		return &acp.Client{}, nil
 	})

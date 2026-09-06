@@ -167,6 +167,13 @@ type AntigravityConfig struct {
 	// per-auth cap is the only bound (legacy behavior). Recommended: equal to
 	// MaxWorkers on single-identity deployments.
 	MaxWorkersTotal int `yaml:"max-workers-total,omitempty" json:"max-workers-total,omitempty"`
+	// PreparedSessions pre-creates fresh ACP sessions on idle workers so an
+	// incoming request can skip the session/new round trip (typically
+	// 1.4-2.9s) and reach session/prompt immediately. Sessions are never
+	// reused across requests, so no conversational context leaks. A value
+	// of 1 keeps one ready session per worker (recommended); 0 disables
+	// preparation (legacy behavior).
+	PreparedSessions int `yaml:"prepared-sessions,omitempty" json:"prepared-sessions,omitempty"`
 	// IdleTimeout is the duration after which an idle persistent worker process is
 	// terminated to reclaim system memory. Empty or "0" disables idle termination (daemon stays warm).
 	// Example: "10m", "1h".

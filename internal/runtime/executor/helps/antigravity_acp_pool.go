@@ -3,6 +3,7 @@ package helps
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -22,6 +23,15 @@ type AntigravityAcpWorker struct {
 	inUse   bool
 	dead    bool
 	deadErr error
+
+	// readySessions caches fresh, never-prompted sessions created
+	// asynchronously while the worker idles, so a request can skip the
+	// session/new round trip entirely. Populated only when the pool has
+	// session preparation enabled (prepareLimit > 0).
+	readySessions []*PreparedSession
+	// refilling marks an in-flight background session/new for this worker,
+	// preventing refill goroutine pile-up.
+	refilling bool
 }
 
 // Client returns the underlying *acp.Client.
@@ -72,6 +82,14 @@ type AntigravityAcpPool struct {
 	idleTimeout time.Duration
 	closed      bool
 
+	// prepareLimit bounds the per-worker cache of pre-created fresh
+	// sessions (0 disables preparation). Sessions are created
+	// asynchronously while the worker idles via sessionPrepare.
+	prepareLimit int
+	// sessionPrepare creates one fresh session on the worker's client.
+	// It is called off the request path; errors are non-fatal.
+	sessionPrepare func(ctx context.Context, w *AntigravityAcpWorker) (*PreparedSession, error)
+
 	// Factory launches a new ACP client for the given key/identity.
 	Factory func(ctx context.Context, key string) (*acp.Client, error)
 }
@@ -97,20 +115,63 @@ func NewAntigravityAcpPool(maxWorkers int, idleTimeout time.Duration, factory fu
 
 // NewAntigravityAcpPoolWithLimits creates a pool with a per-auth cap and a
 // strict global cap. maxTotal <= 0 falls back to plain per-auth capping.
-func NewAntigravityAcpPoolWithLimits(maxWorkersPerAuth, maxTotal int, idleTimeout time.Duration, factory func(ctx context.Context, key string) (*acp.Client, error)) *AntigravityAcpPool {
-	if maxTotal <= 0 {
-		return NewAntigravityAcpPool(maxWorkersPerAuth, idleTimeout, factory)
+// prepareLimit > 0 enables asynchronous fresh-session preparation: idle
+// workers keep up to prepareLimit ready sessions so requests skip the
+// session/new round trip.
+func NewAntigravityAcpPoolWithLimits(maxWorkersPerAuth, maxTotal, prepareLimit int, idleTimeout time.Duration, factory func(ctx context.Context, key string) (*acp.Client, error)) *AntigravityAcpPool {
+	p := newAntigravityAcpPool(maxWorkersPerAuth, maxTotal, idleTimeout, factory)
+	p.prepareLimit = prepareLimit
+	if prepareLimit > 0 {
+		p.sessionPrepare = defaultSessionPrepare
 	}
-	if maxWorkersPerAuth <= 0 {
-		maxWorkersPerAuth = 1
+	return p
+}
+
+// defaultSessionPrepare creates one fresh ACP session on the worker's
+// client. Used when the pool is constructed with preparation enabled and
+// no custom prepare function is injected (tests inject their own).
+func defaultSessionPrepare(ctx context.Context, w *AntigravityAcpWorker) (*PreparedSession, error) {
+	client := w.Client()
+	if client == nil {
+		return nil, fmt.Errorf("acp worker client is nil")
 	}
-	if maxTotal < maxWorkersPerAuth {
-		maxTotal = maxWorkersPerAuth
+	cwd, err := os.Getwd()
+	if err != nil {
+		cwd = "."
 	}
-	p := NewAntigravityAcpPool(maxWorkersPerAuth, idleTimeout, factory)
-	p.maxTotal = maxTotal
-	p.spawnGate = make(chan struct{}, maxTotal)
-	p.slotFreed = make(chan struct{}, 1)
+	sessionID, err := client.NewSession(ctx, cwd)
+	if err != nil {
+		return nil, fmt.Errorf("acp prepared session/new failed: %w", err)
+	}
+	return &PreparedSession{SessionID: sessionID}, nil
+}
+
+// NewAntigravityAcpPool creates a new pool.
+
+// newAntigravityAcpPool builds the base pool shared by all constructors.
+func newAntigravityAcpPool(maxWorkers, maxTotal int, idleTimeout time.Duration, factory func(ctx context.Context, key string) (*acp.Client, error)) *AntigravityAcpPool {
+	if maxWorkers <= 0 {
+		maxWorkers = 1
+	}
+	if maxTotal < maxWorkers {
+		maxTotal = maxWorkers
+	}
+	p := &AntigravityAcpPool{
+		workers:     make(map[string][]*AntigravityAcpWorker),
+		spawning:    make(map[string]chan struct{}),
+		waitQueues:  make(map[string][]chan *AntigravityAcpWorker),
+		maxWorkers:  maxWorkers,
+		maxTotal:    maxTotal,
+		idleTimeout: idleTimeout,
+		Factory:     factory,
+	}
+	if maxTotal > 0 {
+		p.spawnGate = make(chan struct{}, maxTotal)
+		p.slotFreed = make(chan struct{}, 1)
+	}
+	if idleTimeout > 0 {
+		go p.idleCleanupLoop()
+	}
 	return p
 }
 
@@ -359,6 +420,7 @@ func (p *AntigravityAcpPool) Acquire(ctx context.Context, key string, spawnFn fu
 						worker.inUse = true
 						next <- worker
 					}
+					p.maybeRefill(worker)
 					p.mu.Unlock()
 					return nil, err
 				}
@@ -448,6 +510,9 @@ func (p *AntigravityAcpPool) Release(worker *AntigravityAcpWorker, healthy bool)
 		if p.removeWorkerLocked(worker) {
 			p.globalSlotReleaseLocked()
 		}
+		worker.mu.Lock()
+		worker.dropPreparedSessionsLocked()
+		worker.mu.Unlock()
 		closeClientAsync(worker.client)
 
 		// If there are waiters for this key and worker died, wake all up to re-acquire / spawn fresh worker
@@ -471,6 +536,10 @@ func (p *AntigravityAcpPool) Release(worker *AntigravityAcpWorker, healthy bool)
 		next <- worker
 		return
 	}
+
+	// Worker went idle: top up its prepared-session cache off the hot path
+	// so the next request skips session/new entirely.
+	p.maybeRefill(worker)
 
 	// Under a global cap with no same-key waiter, an idle worker of this key
 	// starves other keys: the cap stays full and cross-key waiters only wake
@@ -514,8 +583,13 @@ func (p *AntigravityAcpPool) Close() error {
 	workersToClose := make([]*acp.Client, 0, p.totalWorkersLocked())
 	for k, ws := range p.workers {
 		for _, w := range ws {
-			if w != nil && w.client != nil {
-				workersToClose = append(workersToClose, w.client)
+			if w != nil {
+				w.mu.Lock()
+				w.dropPreparedSessionsLocked()
+				w.mu.Unlock()
+				if w.client != nil {
+					workersToClose = append(workersToClose, w.client)
+				}
 			}
 		}
 		delete(p.workers, k)
