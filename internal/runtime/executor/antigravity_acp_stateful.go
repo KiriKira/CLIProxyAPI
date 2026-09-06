@@ -35,9 +35,24 @@ func statefulTurnSignalsFromOptions(opts cliproxyexecutor.Options) statefulTurnS
 	if v, ok := opts.Metadata[cliproxyexecutor.ACPStatefulReuseMetadataKey].(bool); ok && v {
 		s.reuse = true
 	}
-	if v, ok := opts.Metadata[cliproxyexecutor.ACPStatefulTurnMetadataKey].(int64); ok {
+	switch v := opts.Metadata[cliproxyexecutor.ACPStatefulTurnMetadataKey].(type) {
+	case int64:
 		s.turn = v
 		s.turnValid = true
+	case int:
+		// gin/encoding-json decodes JSON numbers into any as int when the
+		// value fits; accept every Go integer shape defensively.
+		s.turn = int64(v)
+		s.turnValid = true
+	case int32:
+		s.turn = int64(v)
+		s.turnValid = true
+	case float64:
+		// JSON decode into interface{} yields float64.
+		if v == float64(int64(v)) {
+			s.turn = int64(v)
+			s.turnValid = true
+		}
 	}
 	if s.logicalID == "" || !s.turnValid {
 		s.reuse = false

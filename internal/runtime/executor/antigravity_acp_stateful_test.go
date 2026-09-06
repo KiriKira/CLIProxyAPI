@@ -279,6 +279,16 @@ func TestStatefulSignals_ExtractionCoversMalformed(t *testing.T) {
 	if s := statefulTurnSignalsFromOptions(cliproxyexecutor.Options{Metadata: off}); s.reuse {
 		t.Fatalf("reuse must be off when the header is absent/false: %+v", s)
 	}
+	// Turn arrives as plain int through some metadata paths (gin/strconv);
+	// every integer shape must be accepted.
+	intShape := map[string]any{"logical_session_id": "L", "acp_stateful_reuse": true, "acp_stateful_turn": 3}
+	if s := statefulTurnSignalsFromOptions(cliproxyexecutor.Options{Metadata: intShape}); !s.reuse || s.turn != 3 || !s.turnValid {
+		t.Fatalf("int-typed turn must be accepted: %+v", s)
+	}
+	floatShape := map[string]any{"logical_session_id": "L", "acp_stateful_reuse": true, "acp_stateful_turn": float64(4)}
+	if s := statefulTurnSignalsFromOptions(cliproxyexecutor.Options{Metadata: floatShape}); !s.reuse || s.turn != 4 || !s.turnValid {
+		t.Fatalf("float64-typed turn must be accepted: %+v", s)
+	}
 }
 
 // TestStatefulIncrementalTurn_Shapes verifies the incremental extraction
