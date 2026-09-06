@@ -1091,19 +1091,29 @@ func buildPromptBlocks(payload []byte) (blocks []acp.PromptBlock, cleanup func()
 // model differs, so the common warm path reaches session/prompt with zero
 // ACP round trips before it. A rejected variant is a client error: the
 // message carries the daemon verdict so callers can pick an offered model.
-func openSession(ctx context.Context, client *acp.Client, worker *helps.AntigravityAcpWorker, model string, payload []byte) (string, error) {
+// It returns the session id, the serving mode ("prepared" or "fresh") and
+// the resolved variant, and stamps the session stages on the TTFT tracker.
+// The resolved variant is recorded as the worker's preferred variant so the
+// next prepared session is created model-aware (P0.5).
+func openSession(ctx context.Context, client *acp.Client, worker *helps.AntigravityAcpWorker, model string, payload []byte, stages *acpTTFTStage) (string, string, string, error) {
 	variant := resolveAntigravityModel(model, payload)
+	if variant != "" {
+		worker.SetPreferredVariant(variant)
+	}
 
 	// Fast path: a prepared fresh session (never prompted, zero context).
 	if ps := worker.AcquirePreparedSession(); ps != nil {
-		sessionID := ps.SessionID
-		if variant == "" || acp.CurrentModel(client.ConfigOptions(sessionID)) == variant {
-			return sessionID, nil
+		popDone := time.Now()
+		if variant == "" || variant == ps.Variant || acp.CurrentModel(client.ConfigOptions(ps.SessionID)) == variant {
+			// Model-aware prepared hit: no set_config_option round trip.
+			stages.markSessionSetup(popDone, popDone, "prepared")
+			return ps.SessionID, "prepared", variant, nil
 		}
-		if _, err := client.SetConfigOption(ctx, sessionID, "model", variant); err != nil {
-			return "", statusErr{code: http.StatusBadRequest, msg: fmt.Sprintf("Antigravity model %q unavailable: %v", variant, err)}
+		if _, err := client.SetConfigOption(ctx, ps.SessionID, "model", variant); err != nil {
+			return "", "", "", statusErr{code: http.StatusBadRequest, msg: fmt.Sprintf("Antigravity model %q unavailable: %v", variant, err)}
 		}
-		return sessionID, nil
+		stages.markSessionSetup(popDone, time.Now(), "prepared")
+		return ps.SessionID, "prepared", variant, nil
 	}
 
 	// Slow path: create a session now.
@@ -1111,28 +1121,152 @@ func openSession(ctx context.Context, client *acp.Client, worker *helps.Antigrav
 	sessionID, err := client.NewSession(ctx, cwd)
 	if err != nil {
 		if acp.IsSignInRequired(err) {
-			return "", statusErr{code: http.StatusUnauthorized, msg: "Antigravity sign-in required: complete the Google login for this profile, then retry"}
+			return "", "", "", statusErr{code: http.StatusUnauthorized, msg: "Antigravity sign-in required: complete the Google login for this profile, then retry"}
 		}
-		return "", statusErr{code: http.StatusBadGateway, msg: fmt.Sprintf("ACP session/new failed: %v", err)}
+		return "", "", "", statusErr{code: http.StatusBadGateway, msg: fmt.Sprintf("ACP session/new failed: %v", err)}
 	}
+	// Stamp immediately after session/new itself, not after all session
+	// setup (P0.2: session_new_done must mean the session/new round trip).
+	newDone := time.Now()
 	if variant == "" {
-		return sessionID, nil
+		stages.markSessionSetup(newDone, newDone, "fresh")
+		return sessionID, "fresh", variant, nil
 	}
 	if acp.CurrentModel(client.ConfigOptions(sessionID)) == variant {
 		// The daemon-created session already runs the requested model
 		// variant; setting it again would be a wasted round trip.
-		return sessionID, nil
+		stages.markSessionSetup(newDone, newDone, "fresh")
+		return sessionID, "fresh", variant, nil
 	}
 	if _, err := client.SetConfigOption(ctx, sessionID, "model", variant); err != nil {
-		return "", statusErr{code: http.StatusBadRequest, msg: fmt.Sprintf("Antigravity model %q unavailable: %v", variant, err)}
+		return "", "", "", statusErr{code: http.StatusBadRequest, msg: fmt.Sprintf("Antigravity model %q unavailable: %v", variant, err)}
 	}
-	return sessionID, nil
+	stages.markSessionSetup(newDone, time.Now(), "fresh")
+	return sessionID, "fresh", variant, nil
 }
 
 // acpTTFTStage records one stage boundary of the ACP request path. Stage
 // timings distinguish proxy overhead from backend/model latency so
 // optimization effort follows the dominant cost instead of guesswork.
 type acpTTFTStage struct {
+	requestEnter time.Time
+	poolAcquired time.Time
+	// sessionNewDone records completion of session/new itself (or the
+	// prepared-session pop), not the whole session setup (P0.2).
+	sessionNewDone time.Time
+	// modelConfigDone records completion of the optional model
+	// session/set_config_option round trip, separately from session/new.
+	modelConfigDone time.Time
+	promptBuilt     time.Time
+	// promptWritten is stamped from the actual ACP client write path
+	// (SetOnRequestWritten), not immediately before calling Prompt (P0.2).
+	promptWritten time.Time
+	// firstACPStdoutLine is wired from the ACP transport reader (P0.2).
+	firstACPStdoutLine time.Time
+	// firstACPUpdate is the first session/update notification of any kind
+	// (thought, status, or text).
+	firstACPUpdate time.Time
+	// firstTextUpdate is the first MEANINGFUL text token: the first
+	// non-empty agent_message_chunk. User-visible TTFT is measured to
+	// this point (P0.2).
+	firstTextUpdate    time.Time
+	firstChunkEnqueued time.Time
+	// sessionMode exposes which session path served the request:
+	// fresh | prepared | stateful_reuse.
+	sessionMode string
+
+	mu sync.Mutex
+}
+
+// markFirstACPUpdate stamps the first session/update of any kind (once).
+// Safe for the reader-goroutine callback.
+func (s *acpTTFTStage) markFirstACPUpdate(t time.Time) {
+	s.mu.Lock()
+	if s.firstACPUpdate.IsZero() {
+		s.firstACPUpdate = t
+	}
+	s.mu.Unlock()
+}
+
+// markPoolAcquired stamps worker acquisition. Main path only, but routed
+// through the mutex so the snapshot reader can never race it.
+func (s *acpTTFTStage) markPoolAcquired() {
+	s.mu.Lock()
+	s.poolAcquired = time.Now()
+	s.mu.Unlock()
+}
+
+// markSessionSetup stamps the session/new completion, serving mode and
+// model-config completion as one atomic step (openSession owns the
+// sequence and already knows the correct boundaries).
+func (s *acpTTFTStage) markSessionSetup(newDone, modelDone time.Time, mode string) {
+	s.mu.Lock()
+	s.sessionNewDone = newDone
+	s.modelConfigDone = modelDone
+	s.sessionMode = mode
+	s.mu.Unlock()
+}
+
+// markSessionNewDone stamps only the session/new boundary (failure paths).
+func (s *acpTTFTStage) markSessionNewDone(t time.Time) {
+	s.mu.Lock()
+	if s.sessionNewDone.IsZero() {
+		s.sessionNewDone = t
+	}
+	s.mu.Unlock()
+}
+
+// markPromptBuilt stamps prompt-build completion.
+func (s *acpTTFTStage) markPromptBuilt() {
+	s.mu.Lock()
+	s.promptBuilt = time.Now()
+	s.mu.Unlock()
+}
+
+// markChunkEnqueued stamps the first downstream chunk (once).
+func (s *acpTTFTStage) markChunkEnqueued() {
+	s.mu.Lock()
+	if s.firstChunkEnqueued.IsZero() {
+		s.firstChunkEnqueued = time.Now()
+	}
+	s.mu.Unlock()
+}
+
+// markFirstTextUpdate stamps the first non-empty agent_message_chunk (once).
+// Safe for the reader-goroutine callback.
+func (s *acpTTFTStage) markFirstTextUpdate(t time.Time) {
+	s.mu.Lock()
+	if s.firstTextUpdate.IsZero() {
+		s.firstTextUpdate = t
+	}
+	s.mu.Unlock()
+}
+
+// markPromptWritten stamps the actual stdin write of session/prompt. Called
+// from the ACP client write path for that method only.
+func (s *acpTTFTStage) markPromptWritten(t time.Time) {
+	s.mu.Lock()
+	if s.promptWritten.IsZero() {
+		s.promptWritten = t
+	}
+	s.mu.Unlock()
+}
+
+// markStdoutLine stamps the first backend stdout line observed after this
+// request's prompt was written, so a late response of canceled background
+// work (e.g. an interrupted refill) cannot fake a TTFT stage.
+func (s *acpTTFTStage) markStdoutLine(t time.Time) {
+	s.mu.Lock()
+	if !s.promptWritten.IsZero() && s.firstACPStdoutLine.IsZero() {
+		s.firstACPStdoutLine = t
+	}
+	s.mu.Unlock()
+}
+
+// acpTTFTSnapshot is a locked copy of the stage timestamps. The reader
+// goroutine keeps marking stages while a prompt streams, so the log dump
+// must read a consistent snapshot instead of racing individual fields.
+type acpTTFTSnapshot struct {
 	requestEnter       time.Time
 	poolAcquired       time.Time
 	sessionNewDone     time.Time
@@ -1140,36 +1274,85 @@ type acpTTFTStage struct {
 	promptBuilt        time.Time
 	promptWritten      time.Time
 	firstACPStdoutLine time.Time
-	firstSessionUpdate time.Time
+	firstACPUpdate     time.Time
+	firstTextUpdate    time.Time
 	firstChunkEnqueued time.Time
+	sessionMode        string
 }
 
-// elapsed returns the millisecond offset of t from the request-enter
+// snapshot returns a consistent copy of the stage timestamps.
+func (s *acpTTFTStage) snapshot() acpTTFTSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return acpTTFTSnapshot{
+		requestEnter:       s.requestEnter,
+		poolAcquired:       s.poolAcquired,
+		sessionNewDone:     s.sessionNewDone,
+		modelConfigDone:    s.modelConfigDone,
+		promptBuilt:        s.promptBuilt,
+		promptWritten:      s.promptWritten,
+		firstACPStdoutLine: s.firstACPStdoutLine,
+		firstACPUpdate:     s.firstACPUpdate,
+		firstTextUpdate:    s.firstTextUpdate,
+		firstChunkEnqueued: s.firstChunkEnqueued,
+		sessionMode:        s.sessionMode,
+	}
+}
+
+// stageElapsed returns the millisecond offset of t from the request-enter
 // timestamp, or -1 when the stage was never reached.
-func (s *acpTTFTStage) elapsed(t time.Time) int64 {
-	if t.IsZero() || s.requestEnter.IsZero() {
+func stageElapsed(snap acpTTFTSnapshot, t time.Time) int64 {
+	if t.IsZero() || snap.requestEnter.IsZero() {
 		return -1
 	}
-	return t.Sub(s.requestEnter).Milliseconds()
+	return t.Sub(snap.requestEnter).Milliseconds()
 }
 
-// logStageTimings dumps the stage table relative to request_enter. Stages
-// that never happened stay at -1. One log line per request keeps the cost
-// negligible while making proxy-vs-backend attribution possible offline.
+// stageDelta returns the millisecond gap from t back to the first non-zero
+// reference boundary in bases (falling back to requestEnter), attributing
+// exactly one hop to each derived metric. Returns -1 when t was never
+// reached; clamps to 0 when t predates its base (contaminated boundary).
+func stageDelta(snap acpTTFTSnapshot, t time.Time, bases ...time.Time) int64 {
+	if t.IsZero() || snap.requestEnter.IsZero() {
+		return -1
+	}
+	for _, b := range bases {
+		if !b.IsZero() {
+			if t.Before(b) {
+				return 0
+			}
+			return t.Sub(b).Milliseconds()
+		}
+	}
+	return t.Sub(snap.requestEnter).Milliseconds()
+}
+
+// logStageTimings dumps the stage table. Absolute stages stay relative to
+// request_enter (elapsed); the derived metrics in the PLAN follow the stage
+// sequence so each number attributes exactly one hop. Stages that never
+// happened stay at -1. One log line per request keeps the cost negligible
+// while making proxy-vs-backend attribution possible offline.
 func (s *acpTTFTStage) logStageTimings(model string, stream bool) {
+	snap := s.snapshot()
+	mode := snap.sessionMode
+	if mode == "" {
+		mode = "fresh"
+	}
 	log.WithFields(log.Fields{
-		"provider":            "antigravity-acp",
-		"model":               model,
-		"stream":              stream,
-		"pool_wait_ms":        s.elapsed(s.poolAcquired),
-		"session_new_ms":      s.elapsed(s.sessionNewDone),
-		"model_config_ms":     s.elapsed(s.modelConfigDone),
-		"prompt_build_ms":     s.elapsed(s.promptBuilt),
-		"prompt_write_ms":     s.elapsed(s.promptWritten),
-		"first_output_ms":     s.elapsed(s.firstACPStdoutLine),
-		"first_update_ms":     s.elapsed(s.firstSessionUpdate),
-		"first_chunk_ms":      s.elapsed(s.firstChunkEnqueued),
-		"first_token_ttft_ms": s.elapsed(s.firstSessionUpdate),
+		"provider":                          "antigravity-acp",
+		"model":                             model,
+		"stream":                            stream,
+		"session_mode":                      mode,
+		"pool_wait_ms":                      stageElapsed(snap, snap.poolAcquired),
+		"session_new_ms":                    stageDelta(snap, snap.sessionNewDone, snap.poolAcquired, snap.requestEnter),
+		"model_config_ms":                   stageDelta(snap, snap.modelConfigDone, snap.sessionNewDone, snap.poolAcquired, snap.requestEnter),
+		"prompt_build_ms":                   stageDelta(snap, snap.promptBuilt, snap.modelConfigDone, snap.sessionNewDone, snap.poolAcquired, snap.requestEnter),
+		"prompt_write_ms":                   stageDelta(snap, snap.promptWritten, snap.promptBuilt, snap.modelConfigDone, snap.sessionNewDone, snap.poolAcquired, snap.requestEnter),
+		"backend_to_first_output_ms":        stageDelta(snap, snap.firstACPStdoutLine, snap.promptWritten, snap.promptBuilt, snap.modelConfigDone, snap.sessionNewDone, snap.poolAcquired, snap.requestEnter),
+		"first_output_to_first_text_ms":     stageDelta(snap, snap.firstTextUpdate, snap.firstACPStdoutLine, snap.promptWritten, snap.promptBuilt, snap.modelConfigDone, snap.sessionNewDone, snap.poolAcquired, snap.requestEnter),
+		"first_text_to_downstream_chunk_ms": stageDelta(snap, snap.firstChunkEnqueued, snap.firstTextUpdate, snap.firstACPStdoutLine, snap.promptWritten, snap.promptBuilt, snap.modelConfigDone, snap.sessionNewDone, snap.poolAcquired, snap.requestEnter),
+		"first_update_ms":                   stageElapsed(snap, snap.firstACPUpdate),
+		"first_token_ttft_ms":               stageElapsed(snap, snap.firstTextUpdate),
 	}).Info("ACP TTFT stage timings")
 }
 
@@ -1202,7 +1385,7 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 		client = c
 		defer client.Close()
 	}
-	stages.poolAcquired = time.Now()
+	stages.markPoolAcquired()
 
 	healthy := true
 	defer func() {
@@ -1226,33 +1409,48 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 		promptCh <- promptResult{blocks, cleanupAttachments, buildErr}
 	}()
 
-	sessionID, err := openSession(ctx, client, worker, req.Model, req.Payload)
+	sessionID, _, _, err := openSession(ctx, client, worker, req.Model, req.Payload, stages)
 	if err != nil {
 		if acp.IsTransportError(err) {
 			healthy = false
 		}
+		// P0.3: the prompt build may still be running in parallel; drain
+		// its result and always clean staged attachments when the session
+		// path fails, without giving up the session/prompt parallelism.
+		if pr := <-promptCh; pr.cleanup != nil {
+			pr.cleanup()
+		}
 		return resp, err
 	}
-	stages.sessionNewDone = time.Now()
-	stages.modelConfigDone = time.Now()
 
 	prompt := <-promptCh
 	if prompt.err != nil {
+		if prompt.cleanup != nil {
+			prompt.cleanup()
+		}
 		return resp, prompt.err
 	}
 	defer prompt.cleanup()
-	stages.promptBuilt = time.Now()
+	stages.markPromptBuilt()
 
 	var responseText strings.Builder
 	var thoughtText strings.Builder
 	var mu sync.Mutex
 
-	firstUpdateOnce := sync.Once{}
+	client.SetOnRequestWritten(func(method string) {
+		if method == "session/prompt" {
+			stages.markPromptWritten(time.Now())
+		}
+	})
+	client.SetOnFirstLine(func() {
+		stages.markStdoutLine(time.Now())
+	})
 	client.OnUpdate(func(u acp.SessionUpdate) {
 		if u.SessionID != sessionID {
 			return
 		}
-		firstUpdateOnce.Do(func() { stages.firstSessionUpdate = time.Now() })
+		now := time.Now()
+		stages.markFirstACPUpdate(now)
 		mu.Lock()
 		defer mu.Unlock()
 
@@ -1264,6 +1462,7 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 				} `json:"content"`
 			}
 			if err := json.Unmarshal(u.Raw, &chunk); err == nil && chunk.Content.Text != "" {
+				stages.markFirstTextUpdate(now)
 				responseText.WriteString(chunk.Content.Text)
 			}
 		case "agent_thought_chunk":
@@ -1288,7 +1487,6 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 		}
 	}()
 
-	stages.promptWritten = time.Now()
 	stopReason, err := client.Prompt(ctx, sessionID, prompt.blocks)
 	if err != nil {
 		if acp.IsTransportError(err) {
@@ -1330,7 +1528,7 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 		rawResp = helps.EnsureResponsesUsageDetails(rawResp)
 	}
 
-	stages.firstChunkEnqueued = time.Now()
+	stages.markChunkEnqueued()
 	stages.logStageTimings(req.Model, false)
 	return cliproxyexecutor.Response{
 		Payload: rawResp,
@@ -1366,7 +1564,7 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 		}
 		client = c
 	}
-	stages.poolAcquired = time.Now()
+	stages.markPoolAcquired()
 
 	// Prompt construction runs concurrently with session setup so the
 	// pre-prompt latency approaches max(session setup, prompt build).
@@ -1381,17 +1579,21 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 		promptCh <- promptResult{blocks, cleanupAttachments, buildErr}
 	}()
 
-	sessionID, err := openSession(ctx, client, worker, req.Model, req.Payload)
+	sessionID, _, _, err := openSession(ctx, client, worker, req.Model, req.Payload, stages)
 	if err != nil {
 		if worker != nil {
 			e.pool.Release(worker, !acp.IsTransportError(err))
 		} else {
 			client.Close()
 		}
+		// P0.3: the parallel prompt build may still be running; drain its
+		// result and always clean staged attachments on the session-failure
+		// path, without giving up the parallelism.
+		if pr := <-promptCh; pr.cleanup != nil {
+			pr.cleanup()
+		}
 		return nil, err
 	}
-	stages.sessionNewDone = time.Now()
-	stages.modelConfigDone = time.Now()
 
 	chunkChan := make(chan cliproxyexecutor.StreamChunk, 128)
 	result := &cliproxyexecutor.StreamResult{
@@ -1402,7 +1604,7 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 	var streamParam any
 	firstChunkOnce := sync.Once{}
 	emitChunk := func(payload []byte) {
-		firstChunkOnce.Do(func() { stages.firstChunkEnqueued = time.Now() })
+		firstChunkOnce.Do(func() { stages.markChunkEnqueued() })
 		if responseFormat != sdktranslator.FormatOpenAIResponse {
 			chunkChan <- cliproxyexecutor.StreamChunk{Payload: payload}
 			return
@@ -1426,20 +1628,31 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 
 		prompt := <-promptCh
 		if prompt.err != nil {
+			if prompt.cleanup != nil {
+				prompt.cleanup()
+			}
 			chunkChan <- cliproxyexecutor.StreamChunk{
 				Err: prompt.err,
 			}
 			return
 		}
 		defer prompt.cleanup()
-		stages.promptBuilt = time.Now()
+		stages.markPromptBuilt()
 
-		firstUpdateOnce := sync.Once{}
+		client.SetOnRequestWritten(func(method string) {
+			if method == "session/prompt" {
+				stages.markPromptWritten(time.Now())
+			}
+		})
+		client.SetOnFirstLine(func() {
+			stages.markStdoutLine(time.Now())
+		})
 		client.OnUpdate(func(u acp.SessionUpdate) {
 			if u.SessionID != sessionID {
 				return
 			}
-			firstUpdateOnce.Do(func() { stages.firstSessionUpdate = time.Now() })
+			now := time.Now()
+			stages.markFirstACPUpdate(now)
 
 			switch u.Kind {
 			case "agent_message_chunk":
@@ -1449,6 +1662,7 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 					} `json:"content"`
 				}
 				if err := json.Unmarshal(u.Raw, &chunk); err == nil && chunk.Content.Text != "" {
+					stages.markFirstTextUpdate(now)
 					rawJSON := fmt.Sprintf("{\"choices\":[{\"delta\":{\"content\":%s}}]}", string(mustMarshal(chunk.Content.Text)))
 					emitChunk([]byte(rawJSON))
 				}
@@ -1475,7 +1689,6 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 			}
 		}()
 
-		stages.promptWritten = time.Now()
 		_, promptErr := client.Prompt(ctx, sessionID, prompt.blocks)
 		if promptErr != nil {
 			if acp.IsTransportError(promptErr) {

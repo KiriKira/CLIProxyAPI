@@ -32,6 +32,18 @@ type AntigravityAcpWorker struct {
 	// refilling marks an in-flight background session/new for this worker,
 	// preventing refill goroutine pile-up.
 	refilling bool
+	// refillCancel cancels the in-flight background refill so Acquire can
+	// interrupt it before leasing the worker: request-critical ACP
+	// operations must never overlap a background session/new (P0.4).
+	refillCancel context.CancelFunc
+	// refillFinished is closed once the in-flight refill has fully unwound;
+	// Acquire waits on it (settle) after interrupting. Nil when no refill
+	// is in flight.
+	refillFinished chan struct{}
+	// preferredVariant records the resolved model variant of the most recent
+	// request so the next prepared session is created with that variant
+	// already selected (P0.5, model-aware preparation).
+	preferredVariant string
 }
 
 // Client returns the underlying *acp.Client.
@@ -128,8 +140,13 @@ func NewAntigravityAcpPoolWithLimits(maxWorkersPerAuth, maxTotal, prepareLimit i
 }
 
 // defaultSessionPrepare creates one fresh ACP session on the worker's
-// client. Used when the pool is constructed with preparation enabled and
-// no custom prepare function is injected (tests inject their own).
+// client and pre-selects the worker's preferred model variant when one is
+// known, so the hot path can skip session/set_config_option too (P0.5,
+// model-aware preparation). Used when the pool is constructed with
+// preparation enabled and no custom prepare function is injected (tests
+// inject their own). A failed variant selection degrades gracefully: the
+// session is still returned with an empty Variant and the request path
+// applies (and properly surfaces) the model error itself.
 func defaultSessionPrepare(ctx context.Context, w *AntigravityAcpWorker) (*PreparedSession, error) {
 	client := w.Client()
 	if client == nil {
@@ -143,7 +160,18 @@ func defaultSessionPrepare(ctx context.Context, w *AntigravityAcpWorker) (*Prepa
 	if err != nil {
 		return nil, fmt.Errorf("acp prepared session/new failed: %w", err)
 	}
-	return &PreparedSession{SessionID: sessionID}, nil
+	variant := w.PreferredVariant()
+	if variant != "" && acp.CurrentModel(client.ConfigOptions(sessionID)) != variant {
+		if _, err := client.SetConfigOption(ctx, sessionID, "model", variant); err != nil {
+			log.WithFields(map[string]interface{}{
+				"provider": "antigravity-acp",
+				"variant":  variant,
+				"error":    err.Error(),
+			}).Debug("ACP prepared-session model pre-selection failed; request path will retry")
+			return &PreparedSession{SessionID: sessionID}, nil
+		}
+	}
+	return &PreparedSession{SessionID: sessionID, Variant: variant}, nil
 }
 
 // NewAntigravityAcpPool creates a new pool.
@@ -153,7 +181,11 @@ func newAntigravityAcpPool(maxWorkers, maxTotal int, idleTimeout time.Duration, 
 	if maxWorkers <= 0 {
 		maxWorkers = 1
 	}
-	if maxTotal < maxWorkers {
+	// Only a positive global cap is normalized upward: maxTotal <= 0 means
+	// "no global cap; only per-auth caps apply" and must stay uncapped
+	// (P0.1), so an unset max-workers-total can never turn into a real cap
+	// and evict idle workers cross-key.
+	if maxTotal > 0 && maxTotal < maxWorkers {
 		maxTotal = maxWorkers
 	}
 	p := &AntigravityAcpPool{
@@ -341,23 +373,58 @@ func (p *AntigravityAcpPool) Acquire(ctx context.Context, key string, spawnFn fu
 			}
 		}
 
-		// 2. Reuse an idle worker for this key when one exists.
+		// 2. Reuse an idle worker for this key when one exists. A leased
+		// worker must never run request-critical ACP operations while a
+		// background refill session/new is still in flight (P0.4): cancel
+		// the refill and wait for it to settle before handing out the lease.
 		for _, w := range p.workers[key] {
 			w.mu.Lock()
-			if !w.dead && !w.inUse {
-				// Re-check ctx before giving out the lease
-				if err := ctx.Err(); err != nil {
-					w.mu.Unlock()
-					p.mu.Unlock()
-					return nil, err
-				}
-				w.inUse = true
-				w.lastUsedAt = time.Now()
+			if w.dead || w.inUse {
 				w.mu.Unlock()
-				p.mu.Unlock()
-				return w, nil
+				continue
+			}
+			var finished chan struct{}
+			var cancel context.CancelFunc
+			if w.refilling {
+				finished = w.refillFinished
+				cancel = w.refillCancel
 			}
 			w.mu.Unlock()
+			if finished != nil {
+				// Give the in-flight refill a short budget to land its
+				// session: a settled refill means the lease comes with a
+				// ready prepared session (zero session/new on the hot
+				// path). Past the budget, interrupt it and wait for it to
+				// unwind so the leased worker never runs request-critical
+				// ACP operations concurrently with a background refill
+				// (P0.4 invariant holds on every path).
+				select {
+				case <-finished:
+				case <-time.After(acpRefillWaitBudget):
+					if cancel != nil {
+						cancel()
+					}
+					<-finished
+				}
+			}
+			w.mu.Lock()
+			if w.dead || w.inUse || w.refilling {
+				// Lost the race (another acquirer took it, it died, or the
+				// settled refill already restarted); retry the scan.
+				w.mu.Unlock()
+				continue
+			}
+			// Re-check ctx before giving out the lease
+			if err := ctx.Err(); err != nil {
+				w.mu.Unlock()
+				p.mu.Unlock()
+				return nil, err
+			}
+			w.inUse = true
+			w.lastUsedAt = time.Now()
+			w.mu.Unlock()
+			p.mu.Unlock()
+			return w, nil
 		}
 
 		// 3. All matching workers are busy (or none exist). Spawn a fresh one

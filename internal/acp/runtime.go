@@ -79,6 +79,18 @@ type Client struct {
 	updateMu sync.RWMutex
 	onUpdate func(SessionUpdate)
 
+	// lineMu guards onFirstLine. The hook fires on every decoded inbound
+	// line so request paths can timestamp the first backend output (TTFT
+	// attribution) with their own sync.Once.
+	lineMu      sync.RWMutex
+	onFirstLine func()
+
+	// writeHookMu guards onRequestWritten. The hook fires after each
+	// successful outbound request write so callers can timestamp the
+	// actual stdin write instead of a pre-call estimate.
+	writeHookMu      sync.RWMutex
+	onRequestWritten func(method string)
+
 	cfgMu   sync.Mutex
 	sessCfg map[string][]SessionConfigOption
 
@@ -167,6 +179,38 @@ func (c *Client) OnUpdate(fn func(SessionUpdate)) {
 	c.updateMu.Lock()
 	defer c.updateMu.Unlock()
 	c.onUpdate = fn
+}
+
+// SetOnFirstLine registers a hook invoked for every decoded inbound stdout
+// line. Callers wrap it in their own sync.Once to timestamp the first
+// backend output of a turn. It is safe for concurrent use with the reader
+// goroutine; replacing the hook never races with a firing one.
+func (c *Client) SetOnFirstLine(fn func()) {
+	c.lineMu.Lock()
+	defer c.lineMu.Unlock()
+	c.onFirstLine = fn
+}
+
+func (c *Client) getOnFirstLine() func() {
+	c.lineMu.RLock()
+	defer c.lineMu.RUnlock()
+	return c.onFirstLine
+}
+
+// SetOnRequestWritten registers a hook invoked with the JSON-RPC method
+// name after each successful outbound request write. Callers filter by
+// method to timestamp the exact moment a prompt reached the agent's stdin.
+// It is safe for concurrent use.
+func (c *Client) SetOnRequestWritten(fn func(method string)) {
+	c.writeHookMu.Lock()
+	defer c.writeHookMu.Unlock()
+	c.onRequestWritten = fn
+}
+
+func (c *Client) getOnRequestWritten() func(method string) {
+	c.writeHookMu.RLock()
+	defer c.writeHookMu.RUnlock()
+	return c.onRequestWritten
 }
 
 func (c *Client) getOnUpdate() func(SessionUpdate) {
@@ -266,6 +310,9 @@ func (c *Client) call(ctx context.Context, method string, params any) (json.RawM
 	if werr != nil {
 		c.removePending(key)
 		return nil, transportErrorf("write %s: %v", method, werr)
+	}
+	if fn := c.getOnRequestWritten(); fn != nil {
+		fn(method)
 	}
 
 	select {

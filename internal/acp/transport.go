@@ -27,6 +27,9 @@ func (c *Client) readLoop() {
 		if err := json.Unmarshal(c.reader.Bytes(), &msg); err != nil {
 			continue // malformed line: drop it, agent stderr carries diagnostics
 		}
+		if fn := c.getOnFirstLine(); fn != nil {
+			fn()
+		}
 		switch {
 		case msg.isResponse():
 			c.dispatchResponse(&msg)
