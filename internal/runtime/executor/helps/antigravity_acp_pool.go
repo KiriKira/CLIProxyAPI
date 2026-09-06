@@ -542,6 +542,91 @@ func (p *AntigravityAcpPool) Acquire(ctx context.Context, key string, spawnFn fu
 	}
 }
 
+// AcquireSpecific leases one specific worker, waiting until it is free.
+// It never spawns: the target worker must already be a live member of the
+// pool for its key. Stateful session reuse uses this to reacquire the
+// worker that owns the bound ACP session; if that worker is busy serving
+// another prompt, the stateful turn waits for it rather than silently
+// moving to a different process (P1.1 worker rule). On worker death the
+// call fails and the caller bootstraps statelessly.
+func (p *AntigravityAcpPool) AcquireSpecific(ctx context.Context, target *AntigravityAcpWorker) (*AntigravityAcpWorker, error) {
+	if p == nil || target == nil {
+		return nil, fmt.Errorf("acp pool or target worker is nil")
+	}
+	for {
+		p.mu.Lock()
+		if p.closed {
+			p.mu.Unlock()
+			return nil, fmt.Errorf("acp pool is closed")
+		}
+		// The target must still be a member of the pool for its key.
+		present := false
+		for _, w := range p.workers[target.key] {
+			if w == target {
+				present = true
+				break
+			}
+		}
+		if !present {
+			p.mu.Unlock()
+			return nil, fmt.Errorf("acp target worker is no longer in the pool")
+		}
+		target.mu.Lock()
+		if target.dead {
+			target.mu.Unlock()
+			p.mu.Unlock()
+			return nil, fmt.Errorf("acp target worker is dead")
+		}
+		if !target.inUse {
+			if err := ctx.Err(); err != nil {
+				target.mu.Unlock()
+				p.mu.Unlock()
+				return nil, err
+			}
+			// P0.4 holds here too: settle any in-flight refill before the
+			// lease (stateful turns write prompts on this worker).
+			var finished chan struct{}
+			var cancel context.CancelFunc
+			if target.refilling {
+				finished = target.refillFinished
+				cancel = target.refillCancel
+			}
+			target.mu.Unlock()
+			if finished != nil {
+				select {
+				case <-finished:
+				case <-time.After(acpRefillWaitBudget):
+					if cancel != nil {
+						cancel()
+					}
+					<-finished
+				}
+			}
+			target.mu.Lock()
+			if target.dead || target.inUse || target.refilling {
+				// Lost the race or a new refill started; retry.
+				target.mu.Unlock()
+				p.mu.Unlock()
+				continue
+			}
+			target.inUse = true
+			target.lastUsedAt = time.Now()
+			target.mu.Unlock()
+			p.mu.Unlock()
+			return target, nil
+		}
+		target.mu.Unlock()
+		p.mu.Unlock()
+		// Busy: poll with a small sleep bounded by ctx. The busy window of
+		// a prompt turn is the generation time, so no tight spinning.
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
 // launchSpawn resolves the spawn function and builds the client.
 func (p *AntigravityAcpPool) launchSpawn(ctx context.Context, key string, spawnFn func(ctx context.Context) (*acp.Client, error)) (*acp.Client, error) {
 	if spawnFn != nil {

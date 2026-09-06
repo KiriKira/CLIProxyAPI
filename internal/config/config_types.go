@@ -178,6 +178,16 @@ type AntigravityConfig struct {
 	// terminated to reclaim system memory. Empty or "0" disables idle termination (daemon stays warm).
 	// Example: "10m", "1h".
 	IdleTimeout string `yaml:"idle-timeout,omitempty" json:"idle-timeout,omitempty"`
+	// StatefulSessionTTL bounds how long a stateful ACP session binding
+	// stays valid after its last successful continued use (Phase 1 opt-in
+	// feature; requires X-ACP-Session-Reuse: 1 from the client). Empty or
+	// "0" disables binding expiry. Example: "30m".
+	StatefulSessionTTL string `yaml:"stateful-session-ttl,omitempty" json:"stateful-session-ttl,omitempty"`
+	// MaxStatefulSessions bounds the logical-session binding table via LRU
+	// eviction. Eviction only drops the proxy binding; the next request
+	// bootstraps from the full history. Default: 256 when stateful reuse
+	// is used at all; 0 keeps the default.
+	MaxStatefulSessions int `yaml:"max-stateful-sessions,omitempty" json:"max-stateful-sessions,omitempty"`
 }
 
 // CodexConfig configures provider-wide Codex request behavior.

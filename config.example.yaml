@@ -308,6 +308,15 @@ codex:
 #   prepared-sessions: 0          # optional: keep N fresh sessions ready per idle worker so requests
 #                                 # skip session/new (saves ~1.4-2.9s TTFB); 1 recommended, 0 = off
 #   idle-timeout: "0"             # optional: terminate idle persistent workers after duration (e.g. "10m", "1h"); "0" means stay warm
+#   stateful-session-ttl: "30m"   # optional: TTL for opt-in stateful ACP session bindings; refreshes on use
+#   max-stateful-sessions: 256    # optional: LRU bound for the stateful binding table
+#                                 # Stateful reuse is client opt-in per request:
+#                                 #   X-Session-ID: <stable logical session id>
+#                                 #   X-ACP-Session-Reuse: 1
+#                                 #   X-ACP-Session-Turn: <monotonic turn index, starting at 0>
+#                                 # On a verified hit the proxy continues the live ACP session with only
+#                                 # the newest user turn (no session/new); the full history the client
+#                                 # still sends is the recovery source on any miss.
 
 # xAI provider behavior.
 xai:

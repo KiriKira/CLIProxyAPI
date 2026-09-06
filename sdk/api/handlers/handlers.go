@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -195,6 +196,22 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	}
 	if disallowFreeAuthFromContext(ctx) {
 		meta[coreexecutor.DisallowFreeAuthMetadataKey] = true
+	}
+	// Explicit stateful ACP continuation signals (PLAN Phase 1). The reuse
+	// header is the opt-in: without it, executors must keep stateless
+	// semantics even when a session identifier is present.
+	if ginCtx != nil {
+		if sid := strings.TrimSpace(ginCtx.GetHeader("X-Session-ID")); sid != "" {
+			meta[coreexecutor.LogicalSessionIDMetadataKey] = sid
+		}
+		if ginCtx.GetHeader("X-ACP-Session-Reuse") == "1" {
+			meta[coreexecutor.ACPStatefulReuseMetadataKey] = true
+			if turn := strings.TrimSpace(ginCtx.GetHeader("X-ACP-Session-Turn")); turn != "" {
+				if n, err := strconv.ParseInt(turn, 10, 64); err == nil {
+					meta[coreexecutor.ACPStatefulTurnMetadataKey] = n
+				}
+			}
+		}
 	}
 	return meta
 }

@@ -36,6 +36,10 @@ import (
 type AntigravityAcpExecutor struct {
 	cfg  *internalconfig.Config
 	pool *helps.AntigravityAcpPool
+	// stateful holds the opt-in logical-session -> ACP-session bindings
+	// (PLAN Phase 1). Nil when the pool is not persistent; requests without
+	// the X-ACP-Session-Reuse signal never touch it.
+	stateful *helps.StatefulSessionTable
 }
 
 func (e *AntigravityAcpExecutor) authPoolKey(auth *cliproxyauth.Auth) string {
@@ -91,6 +95,20 @@ func NewAntigravityAcpExecutor(cfg *internalconfig.Config) *AntigravityAcpExecut
 			prepareLimit = antigravityPreparedSessionsPerWorker
 		}
 		exec.pool = helps.NewAntigravityAcpPoolWithLimits(maxWorkers, maxTotal, prepareLimit, idleTimeout, nil)
+
+		// Opt-in stateful session reuse (Phase 1). TTL/bound come from the
+		// antigravity config; zero values keep the defaults.
+		statefulTTL := 30 * time.Minute
+		if cfg != nil {
+			if d, err := time.ParseDuration(cfg.Antigravity.StatefulSessionTTL); err == nil && d > 0 {
+				statefulTTL = d
+			}
+		}
+		maxBindings := helps.DefaultMaxStatefulSessions
+		if cfg != nil && cfg.Antigravity.MaxStatefulSessions > 0 {
+			maxBindings = cfg.Antigravity.MaxStatefulSessions
+		}
+		exec.stateful = helps.NewStatefulSessionTable(statefulTTL, maxBindings)
 	}
 
 	return exec
@@ -1363,12 +1381,51 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 	}
 
 	stages := &acpTTFTStage{requestEnter: time.Now()}
+	signals := statefulTurnSignalsFromOptions(opts)
 
 	var client *acp.Client
 	var worker *helps.AntigravityAcpWorker
+	var authKey string
+	var resolvedVariant string
+	// statefulHit marks a validated stateful cache hit: the bound session is
+	// reused, only the incremental turn is prompted, and the binding's turn
+	// advances only after a successful prompt (P1.2/P1.4).
+	statefulHit := false
+	promptPayload := req.Payload
 
 	if e.pool != nil {
-		key := e.authPoolKey(auth)
+		authKey = e.authPoolKey(auth)
+		if signals.reuse && e.stateful != nil {
+			w, _, variant, hit, acqErr := e.acquireStatefulSession(ctx, auth, signals, req.Model, req.Payload, stages)
+			if acqErr != nil {
+				return resp, acqErr
+			}
+			if hit {
+				turnPayload, turnErr := statefulIncrementalTurn(req.Payload)
+				if turnErr == nil {
+					worker = w
+					client = w.Client()
+					statefulHit = true
+					promptPayload = turnPayload
+					resolvedVariant = variant
+					// A hit performs no session/new and no model config:
+					// stamp both session stages at pool acquisition (P0.2
+					// semantics; session_mode distinguishes the path).
+					now := time.Now()
+					stages.markSessionSetup(now, now, "stateful_reuse")
+				} else {
+					// Ambiguous history: release the lease, bootstrap.
+					e.pool.Release(w, true)
+				}
+			}
+		}
+	}
+
+	if worker == nil && e.pool != nil {
+		key := authKey
+		if key == "" {
+			key = e.authPoolKey(auth)
+		}
 		w, acqErr := e.pool.Acquire(ctx, key, func(spawnCtx context.Context) (*acp.Client, error) {
 			return e.spawnClient(spawnCtx, auth)
 		})
@@ -1377,7 +1434,7 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 		}
 		worker = w
 		client = w.Client()
-	} else {
+	} else if worker == nil {
 		c, spawnErr := e.spawnClient(ctx, auth)
 		if spawnErr != nil {
 			return resp, spawnErr
@@ -1385,7 +1442,9 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 		client = c
 		defer client.Close()
 	}
-	stages.markPoolAcquired()
+	if worker == nil || !statefulHit {
+		stages.markPoolAcquired()
+	}
 
 	healthy := true
 	defer func() {
@@ -1397,7 +1456,8 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 	// Prompt construction runs concurrently with session setup: the request
 	// payload is already fully available, so pre-prompt latency approaches
 	// max(session setup, prompt build) instead of their sum. This matters
-	// for large histories and attachment staging.
+	// for large histories and attachment staging. On a stateful hit only
+	// the incremental newest-user-turn payload is built (P1.2).
 	type promptResult struct {
 		blocks  []acp.PromptBlock
 		cleanup func()
@@ -1405,22 +1465,39 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 	}
 	promptCh := make(chan promptResult, 1)
 	go func() {
-		blocks, cleanupAttachments, buildErr := buildPromptBlocks(req.Payload)
+		blocks, cleanupAttachments, buildErr := buildPromptBlocks(promptPayload)
 		promptCh <- promptResult{blocks, cleanupAttachments, buildErr}
 	}()
 
-	sessionID, _, _, err := openSession(ctx, client, worker, req.Model, req.Payload, stages)
-	if err != nil {
-		if acp.IsTransportError(err) {
-			healthy = false
+	sessionID := ""
+	if statefulHit {
+		// Continue the bound ACP session directly.
+		binding, ok := e.stateful.Lookup(logicalLookupKey(signals.logicalID, authKey), worker, authKey, resolvedVariant)
+		if !ok {
+			// Raced invalidation between acquire and here: redo statelessly.
+			statefulHit = false
+		} else {
+			sessionID = binding.ACPSessionID
+			if resolvedVariant == "" {
+				resolvedVariant = resolveAntigravityModel(req.Model, req.Payload)
+			}
 		}
-		// P0.3: the prompt build may still be running in parallel; drain
-		// its result and always clean staged attachments when the session
-		// path fails, without giving up the session/prompt parallelism.
-		if pr := <-promptCh; pr.cleanup != nil {
-			pr.cleanup()
+	}
+	if !statefulHit {
+		var err error
+		sessionID, _, resolvedVariant, err = openSession(ctx, client, worker, req.Model, req.Payload, stages)
+		if err != nil {
+			if acp.IsTransportError(err) {
+				healthy = false
+			}
+			// P0.3: the prompt build may still be running in parallel; drain
+			// its result and always clean staged attachments when the session
+			// path fails, without giving up the session/prompt parallelism.
+			if pr := <-promptCh; pr.cleanup != nil {
+				pr.cleanup()
+			}
+			return resp, err
 		}
-		return resp, err
 	}
 
 	prompt := <-promptCh
@@ -1492,7 +1569,19 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 		if acp.IsTransportError(err) {
 			healthy = false
 		}
+		if statefulHit && signals.reuse {
+			// Ambiguous provider-side state after a failed continued turn:
+			// invalidate so the next request bootstraps from full history
+			// (P1.4). Never advance the binding turn.
+			e.invalidateStateful(signals, authKey)
+		}
 		return resp, statusErr{code: http.StatusInternalServerError, msg: fmt.Sprintf("ACP prompt error: %v", err)}
+	}
+	if signals.reuse {
+		// P1.2/P1.4: bind after a successful prompt — both a bootstrapped
+		// first turn (creates the binding) and a continued turn (advances
+		// LastTurn). A canceled/failed prompt never reaches this line.
+		e.bindStatefulTurn(signals, authKey, sessionID, resolvedVariant, worker, signals.turn)
 	}
 
 	mu.Lock()
@@ -1543,12 +1632,44 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 	}
 
 	stages := &acpTTFTStage{requestEnter: time.Now()}
+	signals := statefulTurnSignalsFromOptions(opts)
 
 	var client *acp.Client
 	var worker *helps.AntigravityAcpWorker
+	var authKey string
+	var resolvedVariant string
+	statefulHit := false
+	promptPayload := req.Payload
 
 	if e.pool != nil {
-		key := e.authPoolKey(auth)
+		authKey = e.authPoolKey(auth)
+		if signals.reuse && e.stateful != nil {
+			w, _, variant, hit, acqErr := e.acquireStatefulSession(ctx, auth, signals, req.Model, req.Payload, stages)
+			if acqErr != nil {
+				return nil, acqErr
+			}
+			if hit {
+				turnPayload, turnErr := statefulIncrementalTurn(req.Payload)
+				if turnErr == nil {
+					worker = w
+					client = w.Client()
+					statefulHit = true
+					promptPayload = turnPayload
+					resolvedVariant = variant
+					now := time.Now()
+					stages.markSessionSetup(now, now, "stateful_reuse")
+				} else {
+					e.pool.Release(w, true)
+				}
+			}
+		}
+	}
+
+	if worker == nil && e.pool != nil {
+		key := authKey
+		if key == "" {
+			key = e.authPoolKey(auth)
+		}
 		w, acqErr := e.pool.Acquire(ctx, key, func(spawnCtx context.Context) (*acp.Client, error) {
 			return e.spawnClient(spawnCtx, auth)
 		})
@@ -1557,17 +1678,20 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 		}
 		worker = w
 		client = w.Client()
-	} else {
+	} else if worker == nil {
 		c, spawnErr := e.spawnClient(ctx, auth)
 		if spawnErr != nil {
 			return nil, spawnErr
 		}
 		client = c
 	}
-	stages.markPoolAcquired()
+	if worker == nil || !statefulHit {
+		stages.markPoolAcquired()
+	}
 
 	// Prompt construction runs concurrently with session setup so the
-	// pre-prompt latency approaches max(session setup, prompt build).
+	// pre-prompt latency approaches max(session setup, prompt build). On a
+	// stateful hit only the incremental newest-user-turn payload is built.
 	type promptResult struct {
 		blocks  []acp.PromptBlock
 		cleanup func()
@@ -1575,24 +1699,39 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 	}
 	promptCh := make(chan promptResult, 1)
 	go func() {
-		blocks, cleanupAttachments, buildErr := buildPromptBlocks(req.Payload)
+		blocks, cleanupAttachments, buildErr := buildPromptBlocks(promptPayload)
 		promptCh <- promptResult{blocks, cleanupAttachments, buildErr}
 	}()
 
-	sessionID, _, _, err := openSession(ctx, client, worker, req.Model, req.Payload, stages)
-	if err != nil {
-		if worker != nil {
-			e.pool.Release(worker, !acp.IsTransportError(err))
+	sessionID := ""
+	if statefulHit {
+		binding, ok := e.stateful.Lookup(logicalLookupKey(signals.logicalID, authKey), worker, authKey, resolvedVariant)
+		if !ok {
+			statefulHit = false
 		} else {
-			client.Close()
+			sessionID = binding.ACPSessionID
+			if resolvedVariant == "" {
+				resolvedVariant = resolveAntigravityModel(req.Model, req.Payload)
+			}
 		}
-		// P0.3: the parallel prompt build may still be running; drain its
-		// result and always clean staged attachments on the session-failure
-		// path, without giving up the parallelism.
-		if pr := <-promptCh; pr.cleanup != nil {
-			pr.cleanup()
+	}
+	if !statefulHit {
+		var err error
+		sessionID, _, resolvedVariant, err = openSession(ctx, client, worker, req.Model, req.Payload, stages)
+		if err != nil {
+			if worker != nil {
+				e.pool.Release(worker, !acp.IsTransportError(err))
+			} else {
+				client.Close()
+			}
+			// P0.3: the parallel prompt build may still be running; drain its
+			// result and always clean staged attachments on the session-failure
+			// path, without giving up the parallelism.
+			if pr := <-promptCh; pr.cleanup != nil {
+				pr.cleanup()
+			}
+			return nil, err
 		}
-		return nil, err
 	}
 
 	chunkChan := make(chan cliproxyexecutor.StreamChunk, 128)
@@ -1694,11 +1833,21 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 			if acp.IsTransportError(promptErr) {
 				healthy = false
 			}
+			if statefulHit && signals.reuse {
+				// Ambiguous provider-side state after a failed continued
+				// turn: invalidate so the next request bootstraps (P1.4).
+				e.invalidateStateful(signals, authKey)
+			}
 			log.Errorf("ACP prompt stream error: %v", promptErr)
 			chunkChan <- cliproxyexecutor.StreamChunk{
 				Err: promptErr,
 			}
 			return
+		}
+		if signals.reuse {
+			// P1.2/P1.4: bind after a successful prompt — both a bootstrapped
+			// first turn and a continued turn (advances LastTurn).
+			e.bindStatefulTurn(signals, authKey, sessionID, resolvedVariant, worker, signals.turn)
 		}
 
 		emitChunk([]byte("data: [DONE]\n\n"))

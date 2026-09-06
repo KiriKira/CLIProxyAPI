@@ -76,6 +76,17 @@ const (
 	SessionAffinityProviderMetadataKey = "session_affinity_provider"
 	// SessionAffinityModelMetadataKey carries the model used during session affinity selection.
 	SessionAffinityModelMetadataKey = "session_affinity_model"
+	// LogicalSessionIDMetadataKey stores the client's stable logical session
+	// id (X-Session-ID). Already part of canonical session identity; the ACP
+	// stateful-reuse feature additionally keys its binding table on it.
+	LogicalSessionIDMetadataKey = "logical_session_id"
+	// ACPStatefulReuseMetadataKey (bool) records the explicit X-ACP-Session-Reuse: 1
+	// opt-in. Absent/false keeps every request stateless regardless of any
+	// session identifier present.
+	ACPStatefulReuseMetadataKey = "acp_stateful_reuse"
+	// ACPStatefulTurnMetadataKey (int64) stores the monotonic X-ACP-Session-Turn
+	// index used for duplicate/skip protection on stateful reuse.
+	ACPStatefulTurnMetadataKey = "acp_stateful_turn"
 )
 
 // Request encapsulates the translated payload that will be sent to a provider executor.
