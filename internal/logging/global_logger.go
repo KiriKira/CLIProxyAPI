@@ -36,9 +36,13 @@ var logFieldOrder = []string{
 	// ACP TTFT stage instrumentation (milliseconds relative to request enter;
 	// -1 means the stage was not reached).
 	"stream",
+	"session_mode",
 	"pool_wait_ms", "session_new_ms", "model_config_ms", "prompt_build_ms",
 	"prompt_write_ms", "first_output_ms", "first_update_ms",
 	"first_chunk_ms", "first_token_ttft_ms",
+	// P0.2 derived one-hop metrics and corrected boundaries.
+	"backend_to_first_output_ms", "first_output_to_first_text_ms",
+	"first_text_to_downstream_chunk_ms",
 	"plugin_id", "plugin_name", "source_id",
 	"version", "active_version", "retired_version", "overwritten",
 	"mode", "budget", "level", "original_mode", "original_value", "min", "max", "clamped_to", "error",
