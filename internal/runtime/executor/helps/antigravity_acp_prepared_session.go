@@ -39,6 +39,7 @@ func (w *AntigravityAcpWorker) AcquirePreparedSession() *PreparedSession {
 		if s == nil || s.SessionID == "" {
 			continue
 		}
+		w.markPreparedSessionConsumedLocked(s.SessionID)
 		return s
 	}
 	return nil
@@ -74,7 +75,11 @@ func (w *AntigravityAcpWorker) trimPreparedSessionsLocked(limit int) {
 		return
 	}
 	for len(w.readySessions) > limit {
+		dropped := w.readySessions[0]
 		w.readySessions = w.readySessions[1:]
+		if dropped != nil {
+			w.abandonSessionLocked(dropped.SessionID)
+		}
 	}
 }
 
@@ -82,7 +87,7 @@ func (w *AntigravityAcpWorker) trimPreparedSessionsLocked(limit int) {
 // Dropped sessions are abandoned server-side (no session/release RPC).
 // Callers must hold w.mu.
 func (w *AntigravityAcpWorker) dropPreparedSessionsLocked() {
-	w.readySessions = nil
+	w.AbandonPreparedSessionsLocked()
 }
 
 // Workers returns a snapshot of the live workers for a key. Introspection
@@ -153,7 +158,12 @@ func (p *AntigravityAcpPool) refillPreparedSessions(w *AntigravityAcpWorker) {
 		return
 	}
 	w.mu.Lock()
-	if w.dead || w.inUse || w.refilling || len(w.readySessions) >= p.prepareLimit {
+	if w.dead || w.draining || w.inUse || w.refilling || len(w.readySessions) >= p.prepareLimit {
+		w.mu.Unlock()
+		return
+	}
+	if w.maxSessionsPerWorker > 0 && w.createdTotal >= uint64(w.maxSessionsPerWorker) {
+		w.markDrainingLocked("session_cap")
 		w.mu.Unlock()
 		return
 	}
@@ -190,6 +200,7 @@ func (p *AntigravityAcpPool) refillPreparedSessions(w *AntigravityAcpWorker) {
 	if sess == nil || sess.SessionID == "" {
 		return
 	}
+	w.RegisterSessionCreated(sess.SessionID, "prepared")
 	w.mu.Lock()
 	if w.dead {
 		w.mu.Unlock()

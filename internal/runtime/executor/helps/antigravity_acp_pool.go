@@ -24,6 +24,19 @@ type AntigravityAcpWorker struct {
 	dead    bool
 	deadErr error
 
+	// Session ledger and hard lifecycle limits. Zero limits preserve the
+	// historical unbounded behavior until an operator opts in.
+	sessions              map[string]workerSessionState
+	createdTotal          uint64
+	prepared              int
+	boundStrict           int
+	boundDocument         int
+	abandoned             int
+	maxSessionsPerWorker  int
+	maxAbandonedPerWorker int
+	draining              bool
+	drainReason           string
+
 	// readySessions caches fresh, never-prompted sessions created
 	// asynchronously while the worker idles, so a request can skip the
 	// session/new round trip entirely. Populated only when the pool has
@@ -85,6 +98,10 @@ type AntigravityAcpPool struct {
 	// maxTotal caps the sum of workers across all keys. Zero means no
 	// additional global bound beyond maxWorkers.
 	maxTotal int
+	// maxSessionsPerWorker and maxAbandonedPerWorker bound daemon-side
+	// session pressure; zero disables the corresponding cap.
+	maxSessionsPerWorker  int
+	maxAbandonedPerWorker int
 	// spawnGate holds one token per admitted worker (capacity maxTotal).
 	// Spawning takes a token non-blockingly; a worker's removal returns it.
 	spawnGate chan struct{}
@@ -131,7 +148,14 @@ func NewAntigravityAcpPool(maxWorkers int, idleTimeout time.Duration, factory fu
 // workers keep up to prepareLimit ready sessions so requests skip the
 // session/new round trip.
 func NewAntigravityAcpPoolWithLimits(maxWorkersPerAuth, maxTotal, prepareLimit int, idleTimeout time.Duration, factory func(ctx context.Context, key string) (*acp.Client, error)) *AntigravityAcpPool {
-	p := newAntigravityAcpPool(maxWorkersPerAuth, maxTotal, idleTimeout, factory)
+	return NewAntigravityAcpPoolWithSessionLimits(maxWorkersPerAuth, maxTotal, prepareLimit, idleTimeout, 0, 0, factory)
+}
+
+// NewAntigravityAcpPoolWithSessionLimits adds hard per-worker daemon-session
+// budgets to the worker and prepared-session limits. A zero session limit keeps
+// the legacy behavior for compatibility.
+func NewAntigravityAcpPoolWithSessionLimits(maxWorkersPerAuth, maxTotal, prepareLimit int, idleTimeout time.Duration, maxSessionsPerWorker, maxAbandonedPerWorker int, factory func(ctx context.Context, key string) (*acp.Client, error)) *AntigravityAcpPool {
+	p := newAntigravityAcpPool(maxWorkersPerAuth, maxTotal, idleTimeout, maxSessionsPerWorker, maxAbandonedPerWorker, factory)
 	p.prepareLimit = prepareLimit
 	if prepareLimit > 0 {
 		p.sessionPrepare = defaultSessionPrepare
@@ -177,7 +201,7 @@ func defaultSessionPrepare(ctx context.Context, w *AntigravityAcpWorker) (*Prepa
 // NewAntigravityAcpPool creates a new pool.
 
 // newAntigravityAcpPool builds the base pool shared by all constructors.
-func newAntigravityAcpPool(maxWorkers, maxTotal int, idleTimeout time.Duration, factory func(ctx context.Context, key string) (*acp.Client, error)) *AntigravityAcpPool {
+func newAntigravityAcpPool(maxWorkers, maxTotal int, idleTimeout time.Duration, maxSessionsPerWorker, maxAbandonedPerWorker int, factory func(ctx context.Context, key string) (*acp.Client, error)) *AntigravityAcpPool {
 	if maxWorkers <= 0 {
 		maxWorkers = 1
 	}
@@ -189,13 +213,15 @@ func newAntigravityAcpPool(maxWorkers, maxTotal int, idleTimeout time.Duration, 
 		maxTotal = maxWorkers
 	}
 	p := &AntigravityAcpPool{
-		workers:     make(map[string][]*AntigravityAcpWorker),
-		spawning:    make(map[string]chan struct{}),
-		waitQueues:  make(map[string][]chan *AntigravityAcpWorker),
-		maxWorkers:  maxWorkers,
-		maxTotal:    maxTotal,
-		idleTimeout: idleTimeout,
-		Factory:     factory,
+		workers:               make(map[string][]*AntigravityAcpWorker),
+		spawning:              make(map[string]chan struct{}),
+		waitQueues:            make(map[string][]chan *AntigravityAcpWorker),
+		maxWorkers:            maxWorkers,
+		maxTotal:              maxTotal,
+		maxSessionsPerWorker:  maxSessionsPerWorker,
+		maxAbandonedPerWorker: maxAbandonedPerWorker,
+		idleTimeout:           idleTimeout,
+		Factory:               factory,
 	}
 	if maxTotal > 0 {
 		p.spawnGate = make(chan struct{}, maxTotal)
@@ -205,6 +231,73 @@ func newAntigravityAcpPool(maxWorkers, maxTotal int, idleTimeout time.Duration, 
 		go p.idleCleanupLoop()
 	}
 	return p
+}
+
+func (p *AntigravityAcpPool) newWorker(key string, client *acp.Client, inUse bool) *AntigravityAcpWorker {
+	return &AntigravityAcpWorker{
+		pool:                  p,
+		key:                   key,
+		client:                client,
+		createdAt:             time.Now(),
+		lastUsedAt:            time.Now(),
+		inUse:                 inUse,
+		sessions:              make(map[string]workerSessionState),
+		maxSessionsPerWorker:  p.maxSessionsPerWorker,
+		maxAbandonedPerWorker: p.maxAbandonedPerWorker,
+	}
+}
+
+func (p *AntigravityAcpPool) wakeWaitersLocked(key string) {
+	if q := p.waitQueues[key]; len(q) > 0 {
+		for _, ch := range q {
+			close(ch)
+		}
+		delete(p.waitQueues, key)
+	}
+}
+
+// tryRecycleWorker removes a draining idle worker and wakes fresh-session
+// waiters so they can acquire a replacement. It is safe to call repeatedly.
+func (p *AntigravityAcpPool) tryRecycleWorker(w *AntigravityAcpWorker, reason string) {
+	if p == nil || w == nil {
+		return
+	}
+	p.mu.Lock()
+	w.mu.Lock()
+	recyclable := w.canRecycleLocked()
+	stats := WorkerSessionStats{
+		CreatedTotal:  w.createdTotal,
+		Prepared:      w.prepared,
+		BoundStrict:   w.boundStrict,
+		BoundDocument: w.boundDocument,
+		Abandoned:     w.abandoned,
+		Draining:      w.draining,
+		DrainReason:   w.drainReason,
+	}
+	w.mu.Unlock()
+	if !recyclable || !p.removeWorkerLocked(w) {
+		p.mu.Unlock()
+		return
+	}
+	p.globalSlotReleaseLocked()
+	p.wakeWaitersLocked(w.key)
+	p.mu.Unlock()
+
+	recycleReason := reason
+	if stats.DrainReason != "" {
+		recycleReason = stats.DrainReason
+	}
+	log.WithFields(map[string]interface{}{
+		"provider":                       "antigravity-acp",
+		"worker_state":                   "draining",
+		"worker_recycle_reason":          recycleReason,
+		"worker_sessions_created":        stats.CreatedTotal,
+		"worker_sessions_prepared":       stats.Prepared,
+		"worker_sessions_bound_strict":   stats.BoundStrict,
+		"worker_sessions_bound_document": stats.BoundDocument,
+		"worker_sessions_abandoned":      stats.Abandoned,
+	}).Info("ACP worker recycled")
+	closeClientAsync(w.client)
 }
 
 // notifySlotFreed signals globally-blocked waiters that a slot came back.
@@ -379,6 +472,18 @@ func (p *AntigravityAcpPool) Acquire(ctx context.Context, key string, spawnFn fu
 		// the refill and wait for it to settle before handing out the lease.
 		for _, w := range p.workers[key] {
 			w.mu.Lock()
+			if w.draining && len(w.readySessions) == 0 {
+				recycle := w.canRecycleLocked()
+				w.mu.Unlock()
+				if recycle {
+					if p.removeWorkerLocked(w) {
+						p.globalSlotReleaseLocked()
+						p.wakeWaitersLocked(key)
+						closeClientAsync(w.client)
+					}
+				}
+				continue
+			}
 			if w.dead || w.inUse {
 				w.mu.Unlock()
 				continue
@@ -408,9 +513,9 @@ func (p *AntigravityAcpPool) Acquire(ctx context.Context, key string, spawnFn fu
 				}
 			}
 			w.mu.Lock()
-			if w.dead || w.inUse || w.refilling {
-				// Lost the race (another acquirer took it, it died, or the
-				// settled refill already restarted); retry the scan.
+			if (w.draining && len(w.readySessions) == 0) || w.dead || w.inUse || w.refilling {
+				// Lost the race (another acquirer took it, it died, the
+				// worker started draining, or the settled refill restarted).
 				w.mu.Unlock()
 				continue
 			}
@@ -471,14 +576,7 @@ func (p *AntigravityAcpPool) Acquire(ctx context.Context, key string, spawnFn fu
 					// Caller canceled during spawn. Save the fresh worker as
 					// idle so other waiters/callers can use it. The worker
 					// owns its global slot from here on.
-					worker := &AntigravityAcpWorker{
-						pool:       p,
-						key:        key,
-						client:     client,
-						createdAt:  time.Now(),
-						lastUsedAt: time.Now(),
-						inUse:      false,
-					}
+					worker := p.newWorker(key, client, false)
 					p.workers[key] = append(p.workers[key], worker)
 					// Handoff to any waiter immediately
 					if q := p.waitQueues[key]; len(q) > 0 {
@@ -492,14 +590,7 @@ func (p *AntigravityAcpPool) Acquire(ctx context.Context, key string, spawnFn fu
 					return nil, err
 				}
 
-				worker := &AntigravityAcpWorker{
-					pool:       p,
-					key:        key,
-					client:     client,
-					createdAt:  time.Now(),
-					lastUsedAt: time.Now(),
-					inUse:      true,
-				}
+				worker := p.newWorker(key, client, true)
 				p.workers[key] = append(p.workers[key], worker)
 				p.mu.Unlock()
 
@@ -644,6 +735,11 @@ func (p *AntigravityAcpPool) Release(worker *AntigravityAcpWorker, healthy bool)
 		return
 	}
 
+	// Keep pool -> worker lock order consistent with Acquire and the idle
+	// recycler. This prevents a release racing a draining decision from
+	// deadlocking on the two mutexes.
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	worker.mu.Lock()
 	if !healthy {
 		worker.dead = true
@@ -651,43 +747,36 @@ func (p *AntigravityAcpPool) Release(worker *AntigravityAcpWorker, healthy bool)
 	isDead := worker.dead
 	worker.inUse = false
 	worker.lastUsedAt = time.Now()
-	worker.mu.Unlock()
+	recycle := worker.canRecycleLocked()
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if p.closed || isDead {
-		// Remove from the pool and reclaim the global slot exactly once,
-		// tied to actual map membership so double releases stay harmless.
+	if p.closed || isDead || recycle {
 		if p.removeWorkerLocked(worker) {
 			p.globalSlotReleaseLocked()
 		}
-		worker.mu.Lock()
-		worker.dropPreparedSessionsLocked()
+		worker.AbandonPreparedSessionsLocked()
 		worker.mu.Unlock()
+		p.wakeWaitersLocked(worker.key)
 		closeClientAsync(worker.client)
-
-		// If there are waiters for this key and worker died, wake all up to re-acquire / spawn fresh worker
-		if q := p.waitQueues[worker.key]; len(q) > 0 {
-			for _, ch := range q {
-				close(ch)
-			}
-			delete(p.waitQueues, worker.key)
-		}
 		return
 	}
 
-	// Check if there are waiters for this key
+	// A draining worker may continue existing strict/document bindings, but it
+	// must not accept fresh traffic or create prepared sessions. Waiters retry
+	// after the binding is eventually abandoned and the worker is recycled.
+	if worker.draining {
+		worker.mu.Unlock()
+		return
+	}
+
 	if q := p.waitQueues[worker.key]; len(q) > 0 {
 		next := q[0]
 		p.waitQueues[worker.key] = q[1:]
-		worker.mu.Lock()
 		worker.inUse = true
-		worker.lastUsedAt = time.Now()
 		worker.mu.Unlock()
 		next <- worker
 		return
 	}
+	worker.mu.Unlock()
 
 	// Worker went idle: top up its prepared-session cache off the hot path
 	// so the next request skips session/new entirely.

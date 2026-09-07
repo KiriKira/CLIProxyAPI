@@ -307,6 +307,8 @@ codex:
 #   max-workers-total: 0          # optional: strict cap across all identities (0 = per-auth caps only)
 #   prepared-sessions: 0          # optional: keep N fresh sessions ready per idle worker so requests
 #                                 # skip session/new (saves ~1.4-2.9s TTFB); 1 recommended, 0 = off
+#   max-sessions-per-worker: 0    # optional: hard successful session/new cap; 0 = legacy unbounded
+#   max-abandoned-sessions-per-worker: 0 # optional: recycle after this many dropped sessions; 0 = off
 #   idle-timeout: "0"             # optional: terminate idle persistent workers after duration (e.g. "10m", "1h"); "0" means stay warm
 #   stateful-session-ttl: "30m"   # optional: TTL for opt-in stateful ACP session bindings; refreshes on use
 #   max-stateful-sessions: 256    # optional: LRU bound for the stateful binding table

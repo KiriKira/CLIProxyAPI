@@ -65,6 +65,39 @@ func TestLogFormatterPrintsMediaForwardingFields(t *testing.T) {
 	}
 }
 
+func TestLogFormatterPrintsACPWorkerLifecycleFields(t *testing.T) {
+	entry := log.NewEntry(log.New())
+	entry.Time = time.Date(2026, 9, 7, 14, 30, 0, 0, time.Local)
+	entry.Level = log.InfoLevel
+	entry.Message = "ACP worker recycled"
+	entry.Data["worker_state"] = "draining"
+	entry.Data["worker_recycle_reason"] = "session_cap"
+	entry.Data["worker_sessions_created"] = uint64(4)
+	entry.Data["worker_sessions_prepared"] = 0
+	entry.Data["worker_sessions_bound_strict"] = 1
+	entry.Data["worker_sessions_bound_document"] = 0
+	entry.Data["worker_sessions_abandoned"] = 3
+
+	formatted, errFormat := (&LogFormatter{}).Format(entry)
+	if errFormat != nil {
+		t.Fatalf("Format() error = %v", errFormat)
+	}
+	line := string(formatted)
+	for _, want := range []string{
+		"worker_state=draining",
+		"worker_recycle_reason=session_cap",
+		"worker_sessions_created=4",
+		"worker_sessions_prepared=0",
+		"worker_sessions_bound_strict=1",
+		"worker_sessions_bound_document=0",
+		"worker_sessions_abandoned=3",
+	} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("formatted line %q missing %s", line, want)
+		}
+	}
+}
+
 func TestLogFormatterPrintsPluginFields(t *testing.T) {
 	entry := log.NewEntry(log.New())
 	entry.Time = time.Date(2026, 6, 25, 20, 10, 0, 0, time.Local)

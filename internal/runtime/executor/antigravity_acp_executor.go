@@ -70,6 +70,8 @@ func NewAntigravityAcpExecutor(cfg *internalconfig.Config) *AntigravityAcpExecut
 	var maxTotal int
 	prepareSessions := false
 	var idleTimeout time.Duration
+	var maxSessionsPerWorker int
+	var maxAbandonedPerWorker int
 
 	if cfg != nil {
 		if cfg.Antigravity.PersistentProcess != nil {
@@ -87,6 +89,12 @@ func NewAntigravityAcpExecutor(cfg *internalconfig.Config) *AntigravityAcpExecut
 		if d, err := time.ParseDuration(cfg.Antigravity.IdleTimeout); err == nil && d > 0 {
 			idleTimeout = d
 		}
+		if cfg.Antigravity.MaxSessionsPerWorker > 0 {
+			maxSessionsPerWorker = cfg.Antigravity.MaxSessionsPerWorker
+		}
+		if cfg.Antigravity.MaxAbandonedSessionsPerWorker > 0 {
+			maxAbandonedPerWorker = cfg.Antigravity.MaxAbandonedSessionsPerWorker
+		}
 	}
 
 	if persistent {
@@ -94,7 +102,7 @@ func NewAntigravityAcpExecutor(cfg *internalconfig.Config) *AntigravityAcpExecut
 		if prepareSessions {
 			prepareLimit = antigravityPreparedSessionsPerWorker
 		}
-		exec.pool = helps.NewAntigravityAcpPoolWithLimits(maxWorkers, maxTotal, prepareLimit, idleTimeout, nil)
+		exec.pool = helps.NewAntigravityAcpPoolWithSessionLimits(maxWorkers, maxTotal, prepareLimit, idleTimeout, maxSessionsPerWorker, maxAbandonedPerWorker, nil)
 
 		// Opt-in stateful session reuse (Phase 1). TTL/bound come from the
 		// antigravity config; zero values keep the defaults.
@@ -1134,6 +1142,7 @@ func openSession(ctx context.Context, client *acp.Client, worker *helps.Antigrav
 			return ps.SessionID, "prepared", variant, nil
 		}
 		if _, err := client.SetConfigOption(ctx, ps.SessionID, "model", variant); err != nil {
+			worker.AbandonSession(ps.SessionID)
 			return "", "", "", statusErr{code: http.StatusBadRequest, msg: fmt.Sprintf("Antigravity model %q unavailable: %v", variant, err)}
 		}
 		stages.markSessionSetup(popDone, time.Now(), "prepared")
@@ -1141,6 +1150,9 @@ func openSession(ctx context.Context, client *acp.Client, worker *helps.Antigrav
 	}
 
 	// Slow path: create a session now.
+	if worker != nil && !worker.AllowSessionCreation() {
+		return "", "", "", helps.ErrSessionCapReached
+	}
 	cwd, _ := os.Getwd()
 	sessionID, err := client.NewSession(ctx, cwd)
 	if err != nil {
@@ -1152,6 +1164,9 @@ func openSession(ctx context.Context, client *acp.Client, worker *helps.Antigrav
 	// Stamp immediately after session/new itself, not after all session
 	// setup (P0.2: session_new_done must mean the session/new round trip).
 	newDone := time.Now()
+	if worker != nil {
+		worker.RegisterSessionCreated(sessionID, "fresh")
+	}
 	if variant == "" {
 		stages.markSessionSetup(newDone, newDone, "fresh")
 		return sessionID, "fresh", variant, nil
@@ -1163,6 +1178,9 @@ func openSession(ctx context.Context, client *acp.Client, worker *helps.Antigrav
 		return sessionID, "fresh", variant, nil
 	}
 	if _, err := client.SetConfigOption(ctx, sessionID, "model", variant); err != nil {
+		if worker != nil {
+			worker.AbandonSession(sessionID)
+		}
 		return "", "", "", statusErr{code: http.StatusBadRequest, msg: fmt.Sprintf("Antigravity model %q unavailable: %v", variant, err)}
 	}
 	stages.markSessionSetup(newDone, time.Now(), "fresh")
@@ -1511,6 +1529,9 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 		if prompt.cleanup != nil {
 			prompt.cleanup()
 		}
+		if worker != nil && !statefulHit {
+			worker.AbandonSession(sessionID)
+		}
 		return resp, prompt.err
 	}
 	defer prompt.cleanup()
@@ -1575,6 +1596,9 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 		if acp.IsTransportError(err) {
 			healthy = false
 		}
+		if worker != nil && !statefulHit {
+			worker.AbandonSession(sessionID)
+		}
 		if statefulHit && signals.reuse {
 			// Ambiguous provider-side state after a failed continued turn:
 			// invalidate so the next request bootstraps from full history
@@ -1588,6 +1612,8 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 		// first turn (creates the binding) and a continued turn (advances
 		// LastTurn). A canceled/failed prompt never reaches this line.
 		e.bindStatefulTurn(signals, authKey, sessionID, resolvedVariant, worker, signals.turn)
+	} else if worker != nil {
+		worker.AbandonSession(sessionID)
 	}
 
 	mu.Lock()
@@ -1776,6 +1802,9 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 			if prompt.cleanup != nil {
 				prompt.cleanup()
 			}
+			if worker != nil && !statefulHit {
+				worker.AbandonSession(sessionID)
+			}
 			chunkChan <- cliproxyexecutor.StreamChunk{
 				Err: prompt.err,
 			}
@@ -1839,6 +1868,9 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 			if acp.IsTransportError(promptErr) {
 				healthy = false
 			}
+			if worker != nil && !statefulHit {
+				worker.AbandonSession(sessionID)
+			}
 			if statefulHit && signals.reuse {
 				// Ambiguous provider-side state after a failed continued
 				// turn: invalidate so the next request bootstraps (P1.4).
@@ -1854,6 +1886,8 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 			// P1.2/P1.4: bind after a successful prompt — both a bootstrapped
 			// first turn and a continued turn (advances LastTurn).
 			e.bindStatefulTurn(signals, authKey, sessionID, resolvedVariant, worker, signals.turn)
+		} else if worker != nil {
+			worker.AbandonSession(sessionID)
 		}
 
 		emitChunk([]byte("data: [DONE]\n\n"))

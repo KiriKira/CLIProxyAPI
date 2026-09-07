@@ -84,6 +84,9 @@ func (t *StatefulSessionTable) removeLocked(el *list.Element) {
 	entry := el.Value.(*bindingEntry)
 	t.lru.Remove(el)
 	delete(t.m, entry.key)
+	if entry.worker != nil && entry.binding != nil {
+		entry.worker.AbandonSession(entry.binding.ACPSessionID)
+	}
 }
 
 // WorkerOf returns the worker currently owning the binding for a key,
@@ -144,6 +147,12 @@ func (t *StatefulSessionTable) Bind(logicalSessionID, acpSessionID, authKey, mod
 	defer t.mu.Unlock()
 	if el, ok := t.m[logicalSessionID]; ok {
 		entry := el.Value.(*bindingEntry)
+		if entry.binding.ACPSessionID != acpSessionID {
+			if entry.worker != nil {
+				entry.worker.AbandonSession(entry.binding.ACPSessionID)
+			}
+			worker.BindSession(acpSessionID, "strict")
+		}
 		entry.binding.ACPSessionID = acpSessionID
 		entry.binding.AuthKey = authKey
 		entry.binding.ModelVariant = modelVariant
@@ -171,6 +180,7 @@ func (t *StatefulSessionTable) Bind(logicalSessionID, acpSessionID, authKey, mod
 		entry.deadline = time.Now().Add(t.ttl)
 	}
 	t.m[logicalSessionID] = t.lru.PushFront(entry)
+	worker.BindSession(acpSessionID, "strict")
 	t.enforceBoundLocked()
 }
 

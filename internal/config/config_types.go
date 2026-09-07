@@ -174,6 +174,13 @@ type AntigravityConfig struct {
 	// of 1 keeps one ready session per worker (recommended); 0 disables
 	// preparation (legacy behavior).
 	PreparedSessions int `yaml:"prepared-sessions,omitempty" json:"prepared-sessions,omitempty"`
+	// MaxSessionsPerWorker bounds successful daemon-side session/new calls
+	// on one worker. Zero preserves legacy behavior; reaching the cap drains
+	// the worker and recycles it once existing bindings are gone.
+	MaxSessionsPerWorker int `yaml:"max-sessions-per-worker,omitempty" json:"max-sessions-per-worker,omitempty"`
+	// MaxAbandonedSessionsPerWorker bounds sessions whose proxy binding has
+	// been dropped while the daemon remains alive. Zero disables this cap.
+	MaxAbandonedSessionsPerWorker int `yaml:"max-abandoned-sessions-per-worker,omitempty" json:"max-abandoned-sessions-per-worker,omitempty"`
 	// IdleTimeout is the duration after which an idle persistent worker process is
 	// terminated to reclaim system memory. Empty or "0" disables idle termination (daemon stays warm).
 	// Example: "10m", "1h".
