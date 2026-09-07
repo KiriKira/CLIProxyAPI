@@ -80,6 +80,12 @@ func (w *AntigravityAcpWorker) MarkDead(err error) {
 	}
 }
 
+type workerRetirement struct {
+	worker       *AntigravityAcpWorker
+	reason       string
+	waitForClose bool
+}
+
 // AntigravityAcpPool manages persistent ACP daemon workers.
 //
 // Workers are grouped per auth key. A single auth may own several workers up
@@ -120,10 +126,10 @@ type AntigravityAcpPool struct {
 	sessionPrepare func(ctx context.Context, w *AntigravityAcpWorker) (*PreparedSession, error)
 
 	// onWorkerRetired is invoked exactly once when a worker is removed from
-	// the pool by forced retirement, cross-key eviction, or idle expiry, so
-	// the owner can purge strict/document bindings that pointed at it. The
-	// hook runs without any pool lock held: binding-table purge paths call
-	// back into the pool (AbandonSession -> tryRecycleWorker). Set once via
+	// the pool, so the owner can purge strict/document bindings that pointed
+	// at it. Ordinary retirement paths invoke the hook outside p.mu before
+	// returning capacity; the binding-table-driven tryRecycle path defers the
+	// same finalizer to avoid re-entering a table lock. Set once via
 	// SetWorkerRetiredHook before the pool serves traffic.
 	onWorkerRetired func(*AntigravityAcpWorker)
 
@@ -131,9 +137,9 @@ type AntigravityAcpPool struct {
 	Factory func(ctx context.Context, key string) (*acp.Client, error)
 }
 
-// SetWorkerRetiredHook registers the binding-purge callback invoked when a
-// worker leaves the pool through any path that does not already go through
-// the executor's Release-time purge. Call it once during construction.
+// SetWorkerRetiredHook registers the binding-purge callback invoked exactly
+// once for every worker removed from the pool. Call it during construction,
+// before the pool serves traffic.
 func (p *AntigravityAcpPool) SetWorkerRetiredHook(fn func(*AntigravityAcpWorker)) {
 	if p == nil {
 		return
@@ -293,18 +299,21 @@ func (p *AntigravityAcpPool) tryRecycleWorker(w *AntigravityAcpWorker, reason st
 		DrainReason:   w.drainReason,
 	}
 	w.mu.Unlock()
-	if !recyclable || !p.removeWorkerLocked(w) {
+	if !recyclable {
 		p.mu.Unlock()
 		return
 	}
-	p.globalSlotReleaseLocked()
-	p.wakeWaitersLocked(w.key)
+	retirement, ok := p.retireWorkerLocked(w, reason)
 	p.mu.Unlock()
+	if !ok {
+		return
+	}
 
 	recycleReason := reason
 	if stats.DrainReason != "" {
 		recycleReason = stats.DrainReason
 	}
+	retirement.reason = recycleReason
 	log.WithFields(map[string]interface{}{
 		"provider":                       "antigravity-acp",
 		"worker_state":                   "draining",
@@ -315,7 +324,7 @@ func (p *AntigravityAcpPool) tryRecycleWorker(w *AntigravityAcpWorker, reason st
 		"worker_sessions_bound_document": stats.BoundDocument,
 		"worker_sessions_abandoned":      stats.Abandoned,
 	}).Info("ACP worker recycled")
-	closeClientAsync(w.client)
+	go p.finishWorkerRetirement(retirement)
 }
 
 // notifySlotFreed signals globally-blocked waiters that a slot came back.
@@ -395,86 +404,99 @@ func closeClientAsync(c *acp.Client) {
 	go func() { _ = c.Close() }()
 }
 
-// notifyWorkerRetired runs the binding-purge hook for a worker that left
-// the pool through forced retirement, cross-key eviction, or idle expiry.
-// Fire-and-forget: the hook purges binding tables, which call back into
-// pool methods (AbandonSession -> tryRecycleWorker), so it must never run
-// while a pool lock is held. Failures are logged, never fatal.
+// notifyWorkerRetired invokes the binding-purge hook for a worker that left
+// the pool. It is called without p.mu held. The callback is deliberately
+// synchronous so ordinary retirement paths finish purging before capacity is
+// handed to another acquirer. tryRecycleWorker is the one exception: it calls
+// this finalizer from binding-table removal paths and runs the finalizer in a
+// goroutine to avoid re-entering that table's lock.
 func (p *AntigravityAcpPool) notifyWorkerRetired(w *AntigravityAcpWorker) {
 	if p == nil || w == nil || p.onWorkerRetired == nil {
 		return
 	}
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.WithFields(map[string]interface{}{
-					"provider": "antigravity-acp",
-					"panic":    fmt.Sprint(r),
-				}).Error("ACP worker-retired hook panicked")
-			}
-		}()
-		p.onWorkerRetired(w)
+	hook := p.onWorkerRetired
+	defer func() {
+		if r := recover(); r != nil {
+			log.WithFields(map[string]interface{}{
+				"provider": "antigravity-acp",
+				"panic":    fmt.Sprint(r),
+			}).Error("ACP worker-retired hook panicked")
+		}
 	}()
+	hook(w)
 }
 
-// retireWorkerLocked removes an idle worker from the pool and returns its
-// global slot. Callers hold p.mu and must keep holding it through
-// finishWorkerRetirement.
-func (p *AntigravityAcpPool) retireWorkerLocked(w *AntigravityAcpWorker) bool {
-	if !p.removeWorkerLocked(w) {
-		return false
+// retireWorkerLocked removes a worker from routing and records its retirement.
+// Capacity handoff, the binding hook, and client close happen after the caller
+// releases p.mu via finishWorkerRetirement.
+func (p *AntigravityAcpPool) retireWorkerLocked(w *AntigravityAcpWorker, reason string) (*workerRetirement, bool) {
+	if w == nil || !p.removeWorkerLocked(w) {
+		return nil, false
 	}
-	p.globalSlotReleaseLocked()
-	return true
+	return &workerRetirement{worker: w, reason: reason}, true
 }
 
 // finishWorkerRetirement completes a retirement started by
-// retireWorkerLocked: schedule the binding purge through the registered
-// hook (asynchronous — it calls back into pool methods), wake same-key
-// fresh waiters, and close the ACP client so its daemon process tree and
-// sessions disappear. Callers hold p.mu; nothing here blocks on it.
-func (p *AntigravityAcpPool) finishWorkerRetirement(w *AntigravityAcpWorker, reason string) {
-	p.notifyWorkerRetired(w)
-	p.wakeWaitersLocked(w.key)
+// retireWorkerLocked. It must be called without p.mu held. The logical global
+// slot is returned only after binding purge and client shutdown has started;
+// physical process-tree waiting remains the R1b follow-up in PLAN.md.
+func (p *AntigravityAcpPool) finishWorkerRetirement(retirement *workerRetirement) {
+	if p == nil || retirement == nil || retirement.worker == nil {
+		return
+	}
+	worker := retirement.worker
+	p.notifyWorkerRetired(worker)
 	log.WithFields(map[string]interface{}{
 		"provider":              "antigravity-acp",
 		"worker_state":          "retired",
-		"worker_recycle_reason": reason,
-	}).Info("ACP worker force-retired; bindings purged, replacement pending")
-	closeClientAsync(w.client)
+		"worker_recycle_reason": retirement.reason,
+	}).Info("ACP worker retired")
+	if retirement.waitForClose {
+		if worker.client != nil {
+			_ = worker.client.Close()
+		}
+	} else {
+		closeClientAsync(worker.client)
+	}
+
+	p.mu.Lock()
+	p.globalSlotReleaseLocked()
+	p.wakeWaitersLocked(worker.key)
+	p.mu.Unlock()
 }
 
-// pruneDeadLocked removes dead workers of a key and closes their clients.
-// It replaces the per-key slice wholesale; every removed worker returns its
-// global slot. Callers must hold p.mu.
-func (p *AntigravityAcpPool) pruneDeadLocked(key string) {
-	ws := p.workers[key]
-	live := make([]*AntigravityAcpWorker, 0, len(ws))
-	for _, w := range ws {
+func (p *AntigravityAcpPool) finishWorkerRetirements(retirements []*workerRetirement) {
+	for _, retirement := range retirements {
+		p.finishWorkerRetirement(retirement)
+	}
+}
+
+// pruneDeadLocked removes dead workers of a key through the same retirement
+// primitive used by every other removal path. Callers must hold p.mu and must
+// finish the returned retirements after unlocking.
+func (p *AntigravityAcpPool) pruneDeadLocked(key string) []*workerRetirement {
+	workers := append([]*AntigravityAcpWorker(nil), p.workers[key]...)
+	retirements := make([]*workerRetirement, 0)
+	for _, w := range workers {
 		w.mu.Lock()
 		dead := w.dead
 		w.mu.Unlock()
-		if dead {
-			p.globalSlotReleaseLocked()
-			closeClientAsync(w.client)
+		if !dead {
 			continue
 		}
-		live = append(live, w)
-	}
-	if len(live) != len(ws) {
-		if len(live) == 0 {
-			delete(p.workers, key)
-		} else {
-			p.workers[key] = live
+		if retirement, ok := p.retireWorkerLocked(w, "dead_worker"); ok {
+			retirements = append(retirements, retirement)
 		}
 	}
+	return retirements
 }
 
 // evictOldestIdleFromOtherKeys frees one global slot by removing the oldest
-// idle worker that belongs to a different key. Callers must hold p.mu.
-func (p *AntigravityAcpPool) evictOldestIdleFromOtherKeys(key string) {
+// idle worker that belongs to a different key. Callers must hold p.mu and
+// finish the returned retirement after unlocking.
+func (p *AntigravityAcpPool) evictOldestIdleFromOtherKeys(key string) *workerRetirement {
 	if p.maxTotal <= 0 {
-		return
+		return nil
 	}
 	var victim *AntigravityAcpWorker
 	var oldest time.Time
@@ -494,16 +516,13 @@ func (p *AntigravityAcpPool) evictOldestIdleFromOtherKeys(key string) {
 		}
 	}
 	if victim == nil {
-		return
+		return nil
 	}
-	if p.removeWorkerLocked(victim) {
-		p.globalSlotReleaseLocked()
-		// The evicted worker may still own strict/document bindings
-		// (draining workers are never inUse but can be bound); purge them
-		// so no client later reacquires a dead worker.
-		p.notifyWorkerRetired(victim)
+	retirement, ok := p.retireWorkerLocked(victim, "cross_key_eviction")
+	if !ok {
+		return nil
 	}
-	closeClientAsync(victim.client)
+	return retirement
 }
 
 // Acquire gets an exclusive lease on an active worker for the given key/identity.
@@ -547,10 +566,10 @@ func (p *AntigravityAcpPool) Acquire(ctx context.Context, key string, spawnFn fu
 				recycle := w.canRecycleLocked()
 				w.mu.Unlock()
 				if recycle {
-					if p.removeWorkerLocked(w) {
-						p.globalSlotReleaseLocked()
-						p.wakeWaitersLocked(key)
-						closeClientAsync(w.client)
+					if retirement, ok := p.retireWorkerLocked(w, "draining_recycle"); ok {
+						p.mu.Unlock()
+						p.finishWorkerRetirement(retirement)
+						continue
 					}
 				}
 				continue
@@ -605,7 +624,7 @@ func (p *AntigravityAcpPool) Acquire(ctx context.Context, key string, spawnFn fu
 
 		// 3. All matching workers are busy (or none exist). Spawn a fresh one
 		// when per-auth capacity remains and the strict global cap allows it.
-		p.pruneDeadLocked(key)
+		pendingRetirements := p.pruneDeadLocked(key)
 		if len(p.workers[key]) < p.maxWorkers {
 			// Take exactly one global slot for the whole spawn attempt. When
 			// the cap is full, try to free one by evicting the oldest idle
@@ -614,7 +633,9 @@ func (p *AntigravityAcpPool) Acquire(ctx context.Context, key string, spawnFn fu
 			if p.globalSlotTryAcquire() {
 				spawnOK = true
 			} else {
-				p.evictOldestIdleFromOtherKeys(key)
+				if retirement := p.evictOldestIdleFromOtherKeys(key); retirement != nil {
+					pendingRetirements = append(pendingRetirements, retirement)
+				}
 				spawnOK = p.globalSlotTryAcquire()
 			}
 			if spawnOK {
@@ -622,6 +643,7 @@ func (p *AntigravityAcpPool) Acquire(ctx context.Context, key string, spawnFn fu
 				spawnCh := make(chan struct{})
 				p.spawning[key] = spawnCh
 				p.mu.Unlock()
+				p.finishWorkerRetirements(pendingRetirements)
 
 				// Launch the worker outside of lock
 				client, err := p.launchSpawn(ctx, key, spawnFn)
@@ -676,11 +698,13 @@ func (p *AntigravityAcpPool) Acquire(ctx context.Context, key string, spawnFn fu
 		// ones still holding strict/document bindings), force-retire one so
 		// this acquirer can spawn a replacement instead of waiting on
 		// lazy binding expiry that may never come.
-		if p.forceRetireIdleDrainingLocked(key) {
+		if retirement := p.forceRetireIdleDrainingLocked(key); retirement != nil {
+			pendingRetirements = append(pendingRetirements, retirement)
 			// A per-auth and/or global slot just came back. Drop the pool
-			// lock (the retirement hook runs asynchronously without it)
-			// and retry the acquire loop from the top.
+			// lock before running the retirement tail, then retry the acquire
+			// loop from the top.
 			p.mu.Unlock()
+			p.finishWorkerRetirements(pendingRetirements)
 			continue
 		}
 
@@ -693,6 +717,7 @@ func (p *AntigravityAcpPool) Acquire(ctx context.Context, key string, spawnFn fu
 			slotFreed = p.slotFreed
 		}
 		p.mu.Unlock()
+		p.finishWorkerRetirements(pendingRetirements)
 
 		select {
 		case <-ctx.Done():
@@ -724,18 +749,17 @@ func (p *AntigravityAcpPool) Acquire(ctx context.Context, key string, spawnFn fu
 // deployment reaching its session cap while still owning bindings), retire
 // one — preferring the least recently used — regardless of its bindings, so
 // fresh-session demand always makes progress. Never touches inUse workers.
-// Callers hold p.mu; the retirement tail (binding purge, waiter wake, client
-// close) runs outside the lock via finishWorkerRetirement.
-func (p *AntigravityAcpPool) forceRetireIdleDrainingLocked(key string) bool {
+// Callers hold p.mu and must finish the returned retirement after unlocking.
+func (p *AntigravityAcpPool) forceRetireIdleDrainingLocked(key string) *workerRetirement {
 	victim := p.oldestIdleDrainingLocked(key)
 	if victim == nil {
-		return false
+		return nil
 	}
-	if !p.retireWorkerLocked(victim) {
-		return false
+	retirement, ok := p.retireWorkerLocked(victim, "forced_drain_retire")
+	if !ok {
+		return nil
 	}
-	p.finishWorkerRetirement(victim, "forced_drain_retire")
-	return true
+	return retirement
 }
 
 // oldestIdleDrainingLocked picks the least recently used idle draining
@@ -862,7 +886,6 @@ func (p *AntigravityAcpPool) Release(worker *AntigravityAcpWorker, healthy bool)
 	// recycler. This prevents a release racing a draining decision from
 	// deadlocking on the two mutexes.
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	worker.mu.Lock()
 	if !healthy {
 		worker.dead = true
@@ -873,13 +896,17 @@ func (p *AntigravityAcpPool) Release(worker *AntigravityAcpWorker, healthy bool)
 	recycle := worker.canRecycleLocked()
 
 	if p.closed || isDead || recycle {
-		if p.removeWorkerLocked(worker) {
-			p.globalSlotReleaseLocked()
+		reason := "draining_recycle"
+		if p.closed {
+			reason = "pool_close_release"
+		} else if isDead {
+			reason = "dead_worker_release"
 		}
+		retirement, _ := p.retireWorkerLocked(worker, reason)
 		worker.AbandonPreparedSessionsLocked()
 		worker.mu.Unlock()
-		p.wakeWaitersLocked(worker.key)
-		closeClientAsync(worker.client)
+		p.mu.Unlock()
+		p.finishWorkerRetirement(retirement)
 		return
 	}
 
@@ -892,6 +919,7 @@ func (p *AntigravityAcpPool) Release(worker *AntigravityAcpWorker, healthy bool)
 	if worker.draining {
 		worker.mu.Unlock()
 		p.wakeWaitersLocked(worker.key)
+		p.mu.Unlock()
 		return
 	}
 
@@ -900,6 +928,7 @@ func (p *AntigravityAcpPool) Release(worker *AntigravityAcpWorker, healthy bool)
 		p.waitQueues[worker.key] = q[1:]
 		worker.inUse = true
 		worker.mu.Unlock()
+		p.mu.Unlock()
 		next <- worker
 		return
 	}
@@ -913,6 +942,7 @@ func (p *AntigravityAcpPool) Release(worker *AntigravityAcpWorker, healthy bool)
 	// starves other keys: the cap stays full and cross-key waiters only wake
 	// on slot removal. Evict this now-idle worker (returning its slot) so a
 	// blocked other-key acquirer can spawn; it will be recreated on demand.
+	var retirement *workerRetirement
 	if p.maxTotal > 0 && p.totalWorkersLocked() >= p.maxTotal {
 		hasOtherWaiters := false
 		for k, q := range p.waitQueues {
@@ -921,11 +951,12 @@ func (p *AntigravityAcpPool) Release(worker *AntigravityAcpWorker, healthy bool)
 				break
 			}
 		}
-		if hasOtherWaiters && p.removeWorkerLocked(worker) {
-			p.globalSlotReleaseLocked()
-			closeClientAsync(worker.client)
+		if hasOtherWaiters {
+			retirement, _ = p.retireWorkerLocked(worker, "release_cross_key_eviction")
 		}
 	}
+	p.mu.Unlock()
+	p.finishWorkerRetirement(retirement)
 }
 
 // Close gracefully closes all workers in the pool.
@@ -940,7 +971,7 @@ func (p *AntigravityAcpPool) Close() error {
 	}
 	p.closed = true
 
-	// Wake all waiters
+	// Wake all waiters.
 	for k, q := range p.waitQueues {
 		for _, ch := range q {
 			close(ch)
@@ -948,46 +979,56 @@ func (p *AntigravityAcpPool) Close() error {
 		delete(p.waitQueues, k)
 	}
 
-	workersToClose := make([]*acp.Client, 0, p.totalWorkersLocked())
-	for k, ws := range p.workers {
-		for _, w := range ws {
-			if w != nil {
-				w.mu.Lock()
-				w.dropPreparedSessionsLocked()
-				w.mu.Unlock()
-				if w.client != nil {
-					workersToClose = append(workersToClose, w.client)
-				}
-			}
-		}
-		delete(p.workers, k)
+	workers := make([]*AntigravityAcpWorker, 0, p.totalWorkersLocked())
+	for _, ws := range p.workers {
+		workers = append(workers, ws...)
 	}
-	if p.maxTotal > 0 {
-		// All slots are reclaimed at once; the pool never admits again.
-		p.globalSlotReleaseLockedAll()
+	retirements := make([]*workerRetirement, 0, len(workers))
+	for _, w := range workers {
+		if w == nil {
+			continue
+		}
+		w.mu.Lock()
+		w.dropPreparedSessionsLocked()
+		w.mu.Unlock()
+		if retirement, ok := p.retireWorkerLocked(w, "pool_close"); ok {
+			retirement.waitForClose = true
+			retirements = append(retirements, retirement)
+		}
 	}
 	p.mu.Unlock()
 
-	for _, c := range workersToClose {
-		_ = c.Close()
-	}
+	p.finishWorkerRetirements(retirements)
 	return nil
 }
 
-// globalSlotReleaseLockedAll drains every global slot token. Callers must hold p.mu.
-func (p *AntigravityAcpPool) globalSlotReleaseLockedAll() {
-	if p.maxTotal <= 0 {
-		return
+func (p *AntigravityAcpPool) expireIdleWorkersLocked(now time.Time) []*workerRetirement {
+	if p.idleTimeout <= 0 {
+		return nil
 	}
-	for {
-		select {
-		case <-p.spawnGate:
+	workers := make([]*AntigravityAcpWorker, 0, p.totalWorkersLocked())
+	for _, ws := range p.workers {
+		workers = append(workers, ws...)
+	}
+	retirements := make([]*workerRetirement, 0)
+	for _, w := range workers {
+		if w == nil {
 			continue
-		default:
 		}
-		break
+		w.mu.Lock()
+		expired := !w.inUse && now.Sub(w.lastUsedAt) > p.idleTimeout
+		if expired {
+			w.dead = true
+		}
+		w.mu.Unlock()
+		if !expired {
+			continue
+		}
+		if retirement, ok := p.retireWorkerLocked(w, "idle_timeout"); ok {
+			retirements = append(retirements, retirement)
+		}
 	}
-	p.notifySlotFreed()
+	return retirements
 }
 
 func (p *AntigravityAcpPool) idleCleanupLoop() {
@@ -1000,46 +1041,8 @@ func (p *AntigravityAcpPool) idleCleanupLoop() {
 			p.mu.Unlock()
 			return
 		}
-		if p.idleTimeout <= 0 {
-			p.mu.Unlock()
-			continue
-		}
-
-		now := time.Now()
-		for k, ws := range p.workers {
-			live := make([]*AntigravityAcpWorker, 0, len(ws))
-			for _, w := range ws {
-				w.mu.Lock()
-				expired := !w.inUse && now.Sub(w.lastUsedAt) > p.idleTimeout
-				if expired {
-					w.dead = true
-				}
-				w.mu.Unlock()
-				if expired {
-					p.globalSlotReleaseLocked()
-					// An idle-expired worker can still own strict/
-					// document bindings; purge them alongside the
-					// removal so no binding survives its dead worker.
-					p.notifyWorkerRetired(w)
-					client := w.client
-					go func(key string, c *acp.Client) {
-						log.Infof("ACP persistent worker for %s idle-timed out; closing", key)
-						if c != nil {
-							_ = c.Close()
-						}
-					}(k, client)
-					continue
-				}
-				live = append(live, w)
-			}
-			if len(live) != len(ws) {
-				if len(live) == 0 {
-					delete(p.workers, k)
-				} else {
-					p.workers[k] = live
-				}
-			}
-		}
+		retirements := p.expireIdleWorkersLocked(time.Now())
 		p.mu.Unlock()
+		p.finishWorkerRetirements(retirements)
 	}
 }

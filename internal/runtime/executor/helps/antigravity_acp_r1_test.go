@@ -147,38 +147,226 @@ func TestAntigravityAcpPool_R1NeverForcesInUseWorker(t *testing.T) {
 	}
 }
 
-// TestAntigravityAcpPool_R1EvictedIdleWorkerPurgesBindings covers the
-// cross-key eviction path: an evicted idle worker that still owns bindings
-// must also go through the retired hook.
-func TestAntigravityAcpPool_R1EvictedIdleWorkerPurgesBindings(t *testing.T) {
-	retiredCh := make(chan *AntigravityAcpWorker, 4)
-	pool := NewAntigravityAcpPoolWithSessionLimits(1, 1, 0, 0, 1, 0, func(ctx context.Context, key string) (*acp.Client, error) {
+// TestAntigravityAcpPool_R1ReleaseCrossKeyEvictionPurgesBothBindingTables
+// covers the Release-specific cross-key eviction path. A bound idle worker is
+// removed only after another auth/key is waiting, and both binding scopes must
+// be purged exactly once.
+func TestAntigravityAcpPool_R1ReleaseCrossKeyEvictionPurgesBothBindingTables(t *testing.T) {
+	retiredCh := make(chan *AntigravityAcpWorker, 2)
+	strict := NewStatefulSessionTable(0, 0)
+	document := NewDocumentSessionTable(0, 0)
+	pool := NewAntigravityAcpPoolWithSessionLimits(1, 1, 0, 0, 0, 0, func(ctx context.Context, key string) (*acp.Client, error) {
+		return &acp.Client{}, nil
+	})
+	pool.SetWorkerRetiredHook(func(w *AntigravityAcpWorker) {
+		strict.PurgeWorker(w)
+		document.PurgeWorker(w)
+		retiredCh <- w
+	})
+	t.Cleanup(func() { _ = pool.Close() })
+
+	w1, err := pool.Acquire(context.Background(), "k1", nil)
+	if err != nil {
+		t.Fatalf("acquire k1: %v", err)
+	}
+	w1.RegisterSessionCreated("strict-session", "fresh")
+	w1.RegisterSessionCreated("document-session", "fresh")
+	strict.Bind("strict-key", "strict-session", "k1", "", w1, 0)
+	document.Bind("document-key", "document-session", "k1", "", w1)
+
+	acquireCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	acquired := make(chan *AntigravityAcpWorker, 1)
+	acquireErr := make(chan error, 1)
+	go func() {
+		w2, errAcquire := pool.Acquire(acquireCtx, "k2", nil)
+		if errAcquire != nil {
+			acquireErr <- errAcquire
+			return
+		}
+		acquired <- w2
+	}()
+	waitFor(t, time.Second, func() bool {
+		pool.mu.Lock()
+		defer pool.mu.Unlock()
+		return len(pool.waitQueues["k2"]) == 1
+	})
+
+	pool.Release(w1, true)
+	select {
+	case victim := <-retiredCh:
+		if victim != w1 {
+			t.Fatalf("retired victim = %p, want %p", victim, w1)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Release cross-key eviction did not invoke retirement hook")
+	}
+	if got := strict.Len(); got != 0 {
+		t.Fatalf("strict bindings after retirement = %d, want 0", got)
+	}
+	if got := document.Len(); got != 0 {
+		t.Fatalf("document bindings after retirement = %d, want 0", got)
+	}
+
+	select {
+	case w2 := <-acquired:
+		pool.Release(w2, true)
+	case errAcquire := <-acquireErr:
+		t.Fatalf("waiting k2 acquire failed after slot release: %v", errAcquire)
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiting k2 acquire did not make progress")
+	}
+	select {
+	case duplicate := <-retiredCh:
+		t.Fatalf("retirement hook called more than once for %p", duplicate)
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+// TestAntigravityAcpPool_R1DeadReleasePurgesBinding verifies that an unhealthy
+// Release also uses the unified retirement hook rather than silently dropping
+// a worker with live strict/document bindings.
+func TestAntigravityAcpPool_R1DeadReleasePurgesBinding(t *testing.T) {
+	retiredCh := make(chan *AntigravityAcpWorker, 1)
+	strict := NewStatefulSessionTable(0, 0)
+	pool := r1TestPool(t, 0, func(w *AntigravityAcpWorker) {
+		strict.PurgeWorker(w)
+		retiredCh <- w
+	})
+
+	w, err := pool.Acquire(context.Background(), "k1", nil)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	w.RegisterSessionCreated("dead-session", "fresh")
+	strict.Bind("dead-key", "dead-session", "k1", "", w, 0)
+	pool.Release(w, false)
+
+	select {
+	case victim := <-retiredCh:
+		if victim != w {
+			t.Fatalf("retired victim = %p, want %p", victim, w)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("dead Release did not invoke retirement hook")
+	}
+	if got := strict.Len(); got != 0 {
+		t.Fatalf("strict bindings after dead release = %d, want 0", got)
+	}
+	select {
+	case <-retiredCh:
+		t.Fatal("dead Release invoked retirement hook more than once")
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+// TestAntigravityAcpPool_R1IdleTimeoutUsesUnifiedRetirement verifies the
+// idle-timeout path through the deterministic locked helper rather than
+// waiting for the production ticker.
+func TestAntigravityAcpPool_R1IdleTimeoutUsesUnifiedRetirement(t *testing.T) {
+	retiredCh := make(chan *AntigravityAcpWorker, 1)
+	pool := NewAntigravityAcpPool(1, 0, func(ctx context.Context, key string) (*acp.Client, error) {
 		return &acp.Client{}, nil
 	})
 	pool.SetWorkerRetiredHook(func(w *AntigravityAcpWorker) { retiredCh <- w })
 	t.Cleanup(func() { _ = pool.Close() })
+	pool.idleTimeout = time.Second
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	w, err := pool.Acquire(context.Background(), "k1", nil)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	pool.Release(w, true)
+	now := time.Unix(100, 0)
+	w.mu.Lock()
+	w.lastUsedAt = now.Add(-2 * time.Second)
+	w.mu.Unlock()
 
-	w1, err := pool.Acquire(ctx, "k1", nil)
+	pool.mu.Lock()
+	retirements := pool.expireIdleWorkersLocked(now)
+	pool.mu.Unlock()
+	pool.finishWorkerRetirements(retirements)
+
+	select {
+	case victim := <-retiredCh:
+		if victim != w {
+			t.Fatalf("retired victim = %p, want %p", victim, w)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("idle timeout did not invoke retirement hook")
+	}
+	if got := len(pool.Workers("k1")); got != 0 {
+		t.Fatalf("workers after idle timeout = %d, want 0", got)
+	}
+}
+
+// TestAntigravityAcpPool_R1SessionAbandonRecycleUsesUnifiedRetirement
+// covers the binding-free draining path, where AbandonSession directly asks
+// the pool to recycle an idle worker.
+func TestAntigravityAcpPool_R1SessionAbandonRecycleUsesUnifiedRetirement(t *testing.T) {
+	retiredCh := make(chan *AntigravityAcpWorker, 1)
+	pool := r1TestPool(t, 1, func(w *AntigravityAcpWorker) { retiredCh <- w })
+
+	w, err := pool.Acquire(context.Background(), "k1", nil)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	pool.Release(w, true)
+	w.RegisterSessionCreated("abandoned-session", "fresh")
+	w.AbandonSession("abandoned-session")
+
+	select {
+	case victim := <-retiredCh:
+		if victim != w {
+			t.Fatalf("retired victim = %p, want %p", victim, w)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("session-abandon recycle did not invoke retirement hook")
+	}
+	if got := len(pool.Workers("k1")); got != 0 {
+		t.Fatalf("workers after session-abandon recycle = %d, want 0", got)
+	}
+	select {
+	case <-retiredCh:
+		t.Fatal("session-abandon recycle invoked retirement hook more than once")
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+// the unified retirement operation for every live worker.
+func TestAntigravityAcpPool_R1ClosePurgesEveryWorker(t *testing.T) {
+	retiredCh := make(chan *AntigravityAcpWorker, 2)
+	pool := NewAntigravityAcpPoolWithLimits(1, 2, 0, 0, func(ctx context.Context, key string) (*acp.Client, error) {
+		return &acp.Client{}, nil
+	})
+	pool.SetWorkerRetiredHook(func(w *AntigravityAcpWorker) { retiredCh <- w })
+
+	w1, err := pool.Acquire(context.Background(), "k1", nil)
 	if err != nil {
 		t.Fatalf("acquire k1: %v", err)
 	}
-	fillToSessionCap(t, pool, w1, 1)
-	pool.Release(w1, true)
-
-	w2, err := pool.Acquire(ctx, "k2", nil)
+	w2, err := pool.Acquire(context.Background(), "k2", nil)
 	if err != nil {
-		t.Fatalf("acquire k2 under global cap: %v", err)
+		t.Fatalf("acquire k2: %v", err)
+	}
+	if err := pool.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	seen := map[*AntigravityAcpWorker]bool{}
+	for i := 0; i < 2; i++ {
+		select {
+		case worker := <-retiredCh:
+			seen[worker] = true
+		case <-time.After(2 * time.Second):
+			t.Fatalf("Close invoked %d retirement hooks, want 2", i)
+		}
+	}
+	if !seen[w1] || !seen[w2] {
+		t.Fatalf("Close retired workers = %#v, want both %p and %p", seen, w1, w2)
 	}
 	select {
-	case victim := <-retiredCh:
-		if victim != w1 {
-			t.Fatalf("evicted victim mismatch")
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatalf("evicted bound worker did not purge bindings")
+	case worker := <-retiredCh:
+		t.Fatalf("Close invoked retirement hook more than once for %p", worker)
+	case <-time.After(20 * time.Millisecond):
 	}
-	pool.Release(w2, true)
 }
