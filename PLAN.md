@@ -4,18 +4,22 @@
 
 1. Keep warm-path ACP TTFT low.
 2. Make ACP daemon/session/harness resource use **bounded over time**, including for fully stateless traffic.
-3. Preserve ordinary stateless OpenAI-compatible behavior unless a client explicitly opts into reuse.
+3. Preserve ordinary stateless OpenAI-compatible behavior by default, while allowing a deliberately configured personal-client fingerprint to enter document-affinity mode automatically.
 4. Keep strict stateful conversation reuse for clients that can provide a stable logical session id, monotonic turn number, and full-history recovery source.
 5. Add a separate **page/document-affinity** mode for segmented translation workloads such as Immersive Translate.
 6. Treat one browser tab/document title as the primary affinity unit for the personal Immersive Translate integration, so the same mechanism covers YouTube subtitles and ordinary long articles instead of implementing separate video/article routing.
 7. Prevent article burst concurrency from recreating one-session-per-request growth.
-8. Record the exact Immersive Translate prompt/header changes required from the user before live testing.
+8. Record the exact Immersive Translate prompt change required from the user before live testing.
+9. Do **not** require the user to add custom request headers: auto-detection from the extension's existing request fingerprint is the primary personal-integration path. Custom headers remain an optional explicit override because current Immersive Translate documentation does support `headerConfigs` in Developer Settings -> Edit Full User Config.
 
 The target behavior is:
 
 ```text
+Immersive Translate request
+  -> recognize client from existing request fingerprint
+  -> derive page/document key from expanded title context
+
 first translation batch for page/document D
-  -> derive page/document key from the expanded title context
   -> create or consume one fresh ACP session
   -> send normal full system prompt + current batch
   -> bind D -> worker + ACP session
@@ -52,12 +56,20 @@ The 2026-09-07 Immersive Translate YouTube test showed:
 
 Therefore resource lifecycle remains P0 even if page/document reuse later makes Immersive Translate itself much cheaper.
 
-## 1.2 Immersive Translate identity evidence
+## 1.2 Immersive Translate request fingerprint and identity evidence
 
 Captured requests establish:
 
 - headers contain no current page URL, YouTube video id, Referer, or other dynamic page identifier;
-- the extension `Origin` identifies the client class, not the current page;
+- the observed Chromium extension requests contain the stable client-class fingerprint:
+
+```http
+Origin: chrome-extension://amkbmndfnliijdhojkpoglbnaaahippg
+Sec-Fetch-Site: none
+```
+
+- browser `User-Agent` is also present but should not be the primary detector because it is not specific to Immersive Translate;
+- the `Origin` identifies the extension/client class, not the current page;
 - every request contains title context produced by Immersive Translate's system-prompt variables;
 - the observed expanded prompt contains:
 
@@ -68,11 +80,24 @@ Title: "<browser tab/page title>"
 ```
 
 - subtitle item ids such as `p0`-`p7` restart on every batch and are not usable as cross-request turns;
-- Immersive Translate allows the user to customize system prompts and request headers.
+- the captured deployment sends no custom X-* business headers today.
 
-Important correction to the earlier plan:
+Important correction to earlier versions of this plan:
 
-> Do not require a direct `{{imt_title}}` variable.
+> Custom request headers are **not required** for the personal integration.
+
+Current Immersive Translate documentation does expose advanced request-header configuration through:
+
+```text
+Developer Settings -> Edit Full User Config
+translationServices.<service>.headerConfigs
+```
+
+so explicit headers are technically possible. However, the preferred personal-deployment behavior is to auto-detect the already-observed extension `Origin`, because that requires no extra client configuration and matches the user's intended deployment.
+
+## 1.3 Prompt-variable correction
+
+Do not require a direct `{{imt_title}}` variable.
 
 The user-confirmed prompt variables include constructs such as:
 
@@ -85,7 +110,7 @@ The user-confirmed prompt variables include constructs such as:
 
 The observed `{{title_prompt}}` expansion already contains the browser-tab/page title. The integration should therefore wrap and parse `{{title_prompt}}` instead of depending on a lower-level title variable that may not be directly exposed in the configured prompt UI.
 
-## 1.3 Core simplification
+## 1.4 Core simplification
 
 Do **not** design separate primary affinity mechanisms for:
 
@@ -96,7 +121,8 @@ Do **not** design separate primary affinity mechanisms for:
 For the personal integration, all are simply segmented translations of the current browser page/document:
 
 ```text
-same normalized browser-tab/page title
+request recognized as Immersive Translate
++ same normalized browser-tab/page title
 + same translation semantic configuration
 + binding still alive/in TTL
 = same document-affinity ACP session
@@ -254,7 +280,7 @@ Do not make Linux `/proc` memory polling part of the first correctness mechanism
 
 ---
 
-# 3. Two Explicit Reuse Contracts
+# 3. Two Reuse Contracts Plus Client Recognition
 
 Do not conflate real conversational state with segmented document translation.
 
@@ -279,7 +305,62 @@ Suitable for TranslateNow/chat-like clients.
 
 ## 3.2 Page/document-affinity mode
 
-New contract:
+Document mode itself does not require a monotonic client turn or full history.
+
+Properties:
+
+- client sends only the current translation batch, not prior batches;
+- proxy groups requests by a page/document identity extracted from the current request;
+- proxy serializes/assigns ordering itself;
+- healthy hit sends only the current user batch into the already-live ACP session;
+- binding loss bootstraps a fresh session from the current request only;
+- lost previous translation context is acceptable recovery behavior because the client did not supply reconstructable history.
+
+`X-ACP-Session-Turn` is not required for document mode.
+
+## 3.3 Primary personal-client activation: auto-detect Immersive Translate
+
+For the user's current Chromium/Edge setup, CLIProxyAPI should be able to enter the Immersive Translate document-affinity profile automatically when the request matches the captured extension fingerprint.
+
+Initial detector:
+
+```text
+Origin == "chrome-extension://amkbmndfnliijdhojkpoglbnaaahippg"
+```
+
+Optional corroborating signals may include:
+
+```text
+Sec-Fetch-Site == "none"
+OpenAI-compatible chat/completions route
+body shape compatible with the known Immersive Translate translation prompt
+```
+
+Rules:
+
+- `Origin` is the main personal-deployment detector because it is extension-specific in the captured traffic;
+- do not use browser `User-Agent` alone;
+- do not use API key value as the client detector;
+- do not require a custom X-* header;
+- detection only selects the **Immersive Translate profile**; the page/session key still comes from the prompt/title context;
+- make the detector configurable/disableable rather than baking an irreversible global behavior into generic OpenAI handling;
+- if future Firefox/Safari/native clients use different origins, add explicit profile fingerprints after capturing them instead of guessing now.
+
+Suggested configuration shape:
+
+```yaml
+antigravity:
+  document-affinity:
+    immersive-translate-auto-detect: true
+    immersive-translate-origins:
+      - "chrome-extension://amkbmndfnliijdhojkpoglbnaaahippg"
+```
+
+Exact config nesting may change during implementation to match existing config style.
+
+## 3.4 Optional explicit activation via custom headers
+
+Immersive Translate's current advanced documentation supports `headerConfigs`, so an optional cleaner explicit contract may remain supported:
 
 ```http
 X-ACP-Session-Reuse: 1
@@ -293,18 +374,22 @@ Optional future field:
 X-ACP-Document-ID: <real URL/page/video/document id>
 ```
 
-Properties:
+This path is **optional**, not required for the user's setup.
 
-- client sends only the current translation batch, not prior batches;
-- proxy groups requests by a page/document identity extracted from the current request;
-- proxy serializes/assigns ordering itself;
-- healthy hit sends only the current user batch into the already-live ACP session;
-- binding loss bootstraps a fresh session from the current request only;
-- lost previous translation context is acceptable recovery behavior because the client did not supply reconstructable history.
+Use cases:
 
-`X-ACP-Session-Turn` is not required for document mode.
+- another client wants to deliberately opt into the same generic document mode;
+- extension `Origin` changes or is hidden by an intermediary;
+- testing wants an unambiguous activation path;
+- a future client can provide a real document id directly.
 
-The static opt-in headers prevent accidental reuse for arbitrary OpenAI-compatible clients.
+Activation priority can be:
+
+```text
+explicit document headers
+  -> configured recognized-client profile (e.g. Immersive Translate Origin)
+  -> ordinary stateless behavior
+```
 
 ---
 
@@ -343,10 +428,11 @@ If the user's existing system prompt has additional translation instructions, ke
 
 Important forwarding behavior:
 
-1. CLIProxyAPI locates the marker block.
-2. After Immersive Translate expands `{{title_prompt}}`, CLIProxyAPI parses the page title from the enclosed content.
-3. CLIProxyAPI removes **only the two marker delimiter lines**.
-4. The actual expanded `title_prompt` content remains in the system prompt forwarded to ACP/model.
+1. CLIProxyAPI recognizes the request as Immersive Translate from the existing request fingerprint (or optional explicit headers).
+2. CLIProxyAPI locates the marker block.
+3. After Immersive Translate expands `{{title_prompt}}`, CLIProxyAPI parses the page title from the enclosed content.
+4. CLIProxyAPI removes **only the two marker delimiter lines**.
+5. The actual expanded `title_prompt` content remains in the system prompt forwarded to ACP/model.
 
 Therefore the marker supplies routing metadata without removing useful title context from the model and without duplicating `{{title_prompt}}`.
 
@@ -374,23 +460,11 @@ Document Metadata:
 Title: "Some Page Title"
 ```
 
-## 4.3 Exact user-side changes to perform later
+## 4.3 Exact user-side change required later
 
-Record these now so the live-test step is reproducible.
+Record this now so the live-test step is reproducible.
 
-### Request headers
-
-In the Immersive Translate custom OpenAI-compatible service, add:
-
-```http
-X-ACP-Session-Reuse: 1
-X-ACP-Session-Scope: document
-X-ACP-Client: immersive-translate
-```
-
-These can be static headers. No dynamic title/page value needs to be interpolated into a header.
-
-### System prompt
+### Required: system prompt wrapper
 
 Find the existing use of:
 
@@ -428,6 +502,22 @@ A minimal combined template is:
 
 Do **not** make the user add a separate `{{imt_title}}` dependency unless a later test proves that variable is directly available and more reliable in the relevant Immersive Translate prompt configuration.
 
+### Not required: custom request headers
+
+No request-header change is required for the primary personal integration because CLIProxyAPI will recognize the captured extension `Origin` automatically.
+
+### Optional: explicit custom headers
+
+If desired later, Immersive Translate currently documents advanced service `headerConfigs` under Developer Settings -> Edit Full User Config. An OpenAI service configuration can therefore optionally add:
+
+```text
+X-ACP-Session-Reuse: 1
+X-ACP-Session-Scope: document
+X-ACP-Client: immersive-translate
+```
+
+Do not make this a prerequisite for implementation or testing.
+
 ### Migration/fallback
 
 For initial A/B testing, CLIProxyAPI may also parse the old unmarked expanded form:
@@ -437,7 +527,7 @@ Document Metadata:
 Title: "..."
 ```
 
-but only when document scope is explicitly opted in (or behind a dedicated personal-client compatibility flag).
+but only after the request has already been recognized as the configured Immersive Translate client profile (or explicitly opted into document mode).
 
 Once the wrapped prompt is confirmed working, the explicit marker should be preferred because it avoids accidentally interpreting unrelated `Title:` text inside arbitrary prompts.
 
@@ -730,31 +820,39 @@ On document-binding loss, the next batch can always start a fresh session. Exact
 7. Global/per-auth worker caps remain correct during draining/replacement.
 8. Race tests show no leaked worker slots or session ledger entries.
 
-## 10.2 Document-affinity functional tests
+## 10.2 Immersive Translate recognition tests
+
+1. Captured Chromium extension `Origin` activates the Immersive Translate document profile when auto-detect is enabled.
+2. Same request stays stateless when auto-detect is disabled and no explicit document headers are present.
+3. Generic browser `User-Agent` without the extension `Origin` does not activate document mode.
+4. Optional explicit document headers activate document mode independently of extension `Origin`.
+5. Unknown extension origins remain stateless until explicitly configured.
+
+## 10.3 Document-affinity functional tests
 
 1. First page request bootstraps exactly one ACP session.
 2. Second request with same normalized title/config performs no `session/new`.
 3. Hit sends only newest user translation batch.
 4. Different title creates a different binding.
 5. Same title under a different model/language/prompt semantic fingerprint does not reuse incompatible context.
-6. Missing document opt-in stays stateless.
-7. Prompt marker is removed while expanded `title_prompt` remains model-visible.
-8. Unmarked `Document Metadata -> Title` fallback works only when explicitly enabled.
-9. Binding TTL/rollover marks old session abandoned.
-10. Cancellation after dispatch invalidates binding.
-11. Worker death invalidates every binding on that worker.
-12. Duplicate completed batch is not appended twice.
-13. Concurrent identical batch coalesces when enabled.
-14. Concurrent cold requests for one page create one session in one-lane mode.
-15. Queue overflow never creates an unbounded fallback session.
-16. Optional two-lane mode never creates lane 3.
+6. Prompt marker is removed while expanded `title_prompt` remains model-visible.
+7. Unmarked `Document Metadata -> Title` fallback works only for an already-recognized/explicit document client.
+8. Binding TTL/rollover marks old session abandoned.
+9. Cancellation after dispatch invalidates binding.
+10. Worker death invalidates every binding on that worker.
+11. Duplicate completed batch is not appended twice.
+12. Concurrent identical batch coalesces when enabled.
+13. Concurrent cold requests for one page create one session in one-lane mode.
+14. Queue overflow never creates an unbounded fallback session.
+15. Optional two-lane mode never creates lane 3.
 
-## 10.3 Immersive Translate YouTube soak test
+## 10.4 Immersive Translate YouTube soak test
 
 Repeat the original subtitle workload well beyond the previous ~25-minute collapse window.
 
 Exit criteria:
 
+- requests are recognized from the existing extension fingerprint without requiring custom X-* headers;
 - first batch logs `document_bootstrap`;
 - later batches with the same page/tab title log `document_reuse`;
 - `session/new` count remains one per active lane until intentional rollover/recycle;
@@ -774,7 +872,7 @@ document_reuse
 stateful_reuse
 ```
 
-## 10.4 Immersive Translate long-article burst test
+## 10.5 Immersive Translate long-article burst test
 
 Use a page large enough to generate many translation requests and enough initial concurrency to exercise a cold-start race.
 
@@ -804,11 +902,12 @@ Integrate fresh/prepared/strict/document session accounting and bounded worker r
 
 **Exit criterion:** indefinite synthetic stateless traffic cannot exceed configured daemon-side session pressure.
 
-## Step 3 — Generic document-affinity core
+## Step 3 — Immersive Translate recognition + generic document-affinity core
 
 Implement:
 
-- document-scope header parsing;
+- configurable Immersive Translate existing-header fingerprint detection, initially using the captured Chromium extension `Origin`;
+- optional explicit document-scope header parsing;
 - `title_prompt` marker extraction;
 - page-title parsing;
 - semantic canonical key;
@@ -820,21 +919,11 @@ Implement:
 - cancellation/invalidation;
 - document reuse logging.
 
-**Exit criterion:** 50 sequential batches with one title/config perform one `session/new` in one-lane mode.
+**Exit criterion:** 50 sequential captured-style Immersive Translate batches with one title/config perform one `session/new` in one-lane mode without any custom X-* request header.
 
-## Step 4 — User modifies Immersive Translate configuration
+## Step 4 — User modifies only the Immersive Translate prompt
 
-Apply the exact recorded changes from section 4.3:
-
-Headers:
-
-```http
-X-ACP-Session-Reuse: 1
-X-ACP-Session-Scope: document
-X-ACP-Client: immersive-translate
-```
-
-Prompt wrapper:
+Required prompt wrapper:
 
 ```text
 [[CLIPROXY_ACP_TITLE_PROMPT:v1]]
@@ -844,7 +933,11 @@ Prompt wrapper:
 
 Keep `{{summary_prompt}}`, `{{terms_prompt}}`, `{{imt_style_guide}}`, and the rest of the translation prompt semantics unchanged.
 
-**Exit criterion:** live captured request produces a deterministic page-title key and unchanged translation output structure.
+No request-header modification is required.
+
+Optionally test explicit `headerConfigs` later as a cleaner alternate activation path, not as a prerequisite.
+
+**Exit criterion:** live captured request is auto-recognized, produces a deterministic page-title key, and keeps unchanged translation output structure.
 
 ## Step 5 — YouTube soak test
 
@@ -883,14 +976,16 @@ If backend generation dominates, stop rather than adding complexity for insignif
 
 # 12. Guardrails / Non-Goals
 
-- Do not auto-reuse prompted sessions for arbitrary clients without explicit opt-in.
+- Do not auto-reuse prompted sessions for arbitrary clients; automatic document reuse is limited to explicitly configured recognized-client fingerprints such as the user's Immersive Translate extension Origin.
+- Do not use generic browser `User-Agent` as sufficient identification.
+- Do not require custom X-* headers for the personal Immersive Translate integration.
 - Do not treat document mode as an exactly recoverable conversation.
 - Do not require a direct `{{imt_title}}` variable for the initial Immersive Translate integration.
 - Do not split the core design into separate YouTube-video versus article affinity mechanisms; both are page/document title affinity.
-- Do not interpret arbitrary `Title:` text globally; marker or explicit compatibility mode must gate parsing.
+- Do not interpret arbitrary `Title:` text globally; prompt marker or a recognized/explicit document client must gate parsing.
 - Do not claim raw title alone is globally unique.
 - Do not let article concurrency bypass worker/session budgets by spawning unlimited lanes.
 - Do not claim `prepared-sessions: 0` fixes the session/harness lifecycle problem.
 - Do not assume a usable ACP `session/release` exists unless verified against the actual Antigravity daemon.
 - If a reliable daemon-side session dispose/release RPC is later discovered, integrate it and reduce reliance on whole-worker recycling.
-- Preserve stateless compatibility for clients that do not opt into strict/document reuse.
+- Preserve stateless compatibility for clients outside recognized/explicit document profiles.
