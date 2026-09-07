@@ -188,6 +188,13 @@ type AntigravityConfig struct {
 	// bootstraps from the full history. Default: 256 when stateful reuse
 	// is used at all; 0 keeps the default.
 	MaxStatefulSessions int `yaml:"max-stateful-sessions,omitempty" json:"max-stateful-sessions,omitempty"`
+	// DaemonEnv appends extra environment variables to every ACP daemon
+	// spawn (KEY=VALUE entries, applied after the built-in env so they can
+	// override). The daemon process env is otherwise a fixed whitelist, so
+	// systemd-injected proxy variables never reach it; use this to route
+	// the daemon's Google traffic through a local proxy, e.g.
+	// HTTPS_PROXY=socks5://127.0.0.1:1080.
+	DaemonEnv []string `yaml:"daemon-env,omitempty" json:"daemon-env,omitempty"`
 }
 
 // CodexConfig configures provider-wide Codex request behavior.

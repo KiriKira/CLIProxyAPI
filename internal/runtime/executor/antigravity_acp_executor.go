@@ -372,6 +372,12 @@ func (e *AntigravityAcpExecutor) spawnClient(ctx context.Context, auth *cliproxy
 		"PYTHONUNBUFFERED=1",
 		"ELECTRON_RUN_AS_NODE=1",
 	}
+	// Optional operator-provided daemon env (e.g. HTTPS_PROXY for a local
+	// SOCKS relay when the host IP is geo-blocked). Applied last so entries
+	// can override the built-ins above.
+	if e.cfg != nil && len(e.cfg.Antigravity.DaemonEnv) > 0 {
+		env = append(env, e.cfg.Antigravity.DaemonEnv...)
+	}
 	// Only the selected method's credential reaches the agent.
 	switch ac.method {
 	case acpAuthGeminiAPIKey:
