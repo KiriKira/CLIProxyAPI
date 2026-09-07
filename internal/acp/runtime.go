@@ -152,8 +152,9 @@ func NewClient(cfg SpawnConfig) (*Client, error) {
 	// Run each ACP daemon in its own process group so Close can reclaim
 	// daemon-spawned harness descendants as one lifecycle unit.
 	configureProcessGroup(cmd)
-	// Portable kill for future CommandContext use and hung processes.
-	cmd.Cancel = func() error { return cmd.Process.Kill() }
+	// Forceful cancellation must reclaim daemon descendants as well. Normal
+	// Close still gets the graceful stdin-EOF path before escalation.
+	cmd.Cancel = func() error { return killProcessGroup(cmd.Process) }
 	cmd.WaitDelay = closeKillGrace
 
 	stdinPipe, err := cmd.StdinPipe()
