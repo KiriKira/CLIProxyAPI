@@ -94,10 +94,11 @@ type workerRetirement struct {
 // worker holds one slot token from spawn until removal, which makes the cap
 // strict even across per-key spawns.
 type AntigravityAcpPool struct {
-	mu         sync.Mutex
-	workers    map[string][]*AntigravityAcpWorker
-	spawning   map[string]chan struct{}
-	waitQueues map[string][]chan *AntigravityAcpWorker
+	mu            sync.Mutex
+	workers       map[string][]*AntigravityAcpWorker
+	retiringByKey map[string]int
+	spawning      map[string]chan struct{}
+	waitQueues    map[string][]chan *AntigravityAcpWorker
 	// maxWorkers caps workers per auth key (per-key map growth bound).
 	maxWorkers int
 	// maxTotal caps the sum of workers across all keys. Zero means no
@@ -112,9 +113,12 @@ type AntigravityAcpPool struct {
 	spawnGate chan struct{}
 	// slotFreed is broadcast (non-blocking send) whenever a global slot is
 	// returned, so globally-blocked waiters can retry their spawn attempt.
-	slotFreed   chan struct{}
-	idleTimeout time.Duration
-	closed      bool
+	slotFreed             chan struct{}
+	idleTimeout           time.Duration
+	closed                bool
+	retiringCount         int
+	retirementsDone       chan struct{}
+	retirementsDoneClosed bool
 
 	// prepareLimit bounds the per-worker cache of pre-created fresh
 	// sessions (0 disables preparation). Sessions are created
@@ -155,12 +159,14 @@ func NewAntigravityAcpPool(maxWorkers int, idleTimeout time.Duration, factory fu
 		maxWorkers = 1
 	}
 	p := &AntigravityAcpPool{
-		workers:     make(map[string][]*AntigravityAcpWorker),
-		spawning:    make(map[string]chan struct{}),
-		waitQueues:  make(map[string][]chan *AntigravityAcpWorker),
-		maxWorkers:  maxWorkers,
-		idleTimeout: idleTimeout,
-		Factory:     factory,
+		workers:         make(map[string][]*AntigravityAcpWorker),
+		retiringByKey:   make(map[string]int),
+		spawning:        make(map[string]chan struct{}),
+		waitQueues:      make(map[string][]chan *AntigravityAcpWorker),
+		maxWorkers:      maxWorkers,
+		idleTimeout:     idleTimeout,
+		retirementsDone: make(chan struct{}),
+		Factory:         factory,
 	}
 	if idleTimeout > 0 {
 		go p.idleCleanupLoop()
@@ -240,6 +246,7 @@ func newAntigravityAcpPool(maxWorkers, maxTotal int, idleTimeout time.Duration, 
 	}
 	p := &AntigravityAcpPool{
 		workers:               make(map[string][]*AntigravityAcpWorker),
+		retiringByKey:         make(map[string]int),
 		spawning:              make(map[string]chan struct{}),
 		waitQueues:            make(map[string][]chan *AntigravityAcpWorker),
 		maxWorkers:            maxWorkers,
@@ -247,6 +254,7 @@ func newAntigravityAcpPool(maxWorkers, maxTotal int, idleTimeout time.Duration, 
 		maxSessionsPerWorker:  maxSessionsPerWorker,
 		maxAbandonedPerWorker: maxAbandonedPerWorker,
 		idleTimeout:           idleTimeout,
+		retirementsDone:       make(chan struct{}),
 		Factory:               factory,
 	}
 	if maxTotal > 0 {
@@ -350,6 +358,12 @@ func (p *AntigravityAcpPool) totalWorkersLocked() int {
 	return total
 }
 
+// keyWorkerCountLocked includes workers detached from routing but still
+// occupying the per-key hard process-capacity reservation. Callers hold p.mu.
+func (p *AntigravityAcpPool) keyWorkerCountLocked(key string) int {
+	return len(p.workers[key]) + p.retiringByKey[key]
+}
+
 // globalSlotTryAcquire takes one global spawn slot without blocking. Callers
 // must hold p.mu. Always false when no global cap is configured.
 func (p *AntigravityAcpPool) globalSlotTryAcquire() bool {
@@ -435,6 +449,11 @@ func (p *AntigravityAcpPool) retireWorkerLocked(w *AntigravityAcpWorker, reason 
 	if w == nil || !p.removeWorkerLocked(w) {
 		return nil, false
 	}
+	if p.retiringByKey == nil {
+		p.retiringByKey = make(map[string]int)
+	}
+	p.retiringByKey[w.key]++
+	p.retiringCount++
 	return &workerRetirement{worker: w, reason: reason}, true
 }
 
@@ -469,6 +488,21 @@ func (p *AntigravityAcpPool) finishWorkerRetirement(retirement *workerRetirement
 	}
 
 	p.mu.Lock()
+	if n := p.retiringByKey[worker.key]; n <= 1 {
+		delete(p.retiringByKey, worker.key)
+	} else {
+		p.retiringByKey[worker.key] = n - 1
+	}
+	if p.retiringCount > 0 {
+		p.retiringCount--
+	}
+	if p.closed && p.retiringCount == 0 && !p.retirementsDoneClosed {
+		if p.retirementsDone == nil {
+			p.retirementsDone = make(chan struct{})
+		}
+		close(p.retirementsDone)
+		p.retirementsDoneClosed = true
+	}
 	p.globalSlotReleaseLocked()
 	p.wakeWaitersLocked(worker.key)
 	p.mu.Unlock()
@@ -634,7 +668,7 @@ func (p *AntigravityAcpPool) Acquire(ctx context.Context, key string, spawnFn fu
 		// 3. All matching workers are busy (or none exist). Spawn a fresh one
 		// when per-auth capacity remains and the strict global cap allows it.
 		pendingRetirements := p.pruneDeadLocked(key)
-		if len(p.workers[key]) < p.maxWorkers {
+		if p.keyWorkerCountLocked(key) < p.maxWorkers {
 			// Take exactly one global slot for the whole spawn attempt. When
 			// the cap is full, try to free one by evicting the oldest idle
 			// worker from another key, then take the slot once.
@@ -975,10 +1009,23 @@ func (p *AntigravityAcpPool) Close() error {
 	}
 	p.mu.Lock()
 	if p.closed {
+		done := p.retirementsDone
+		if done == nil {
+			done = make(chan struct{})
+			p.retirementsDone = done
+		}
+		if p.retiringCount == 0 && !p.retirementsDoneClosed {
+			close(done)
+			p.retirementsDoneClosed = true
+		}
 		p.mu.Unlock()
+		<-done
 		return nil
 	}
 	p.closed = true
+	if p.retirementsDone == nil {
+		p.retirementsDone = make(chan struct{})
+	}
 
 	// Wake all waiters.
 	for k, q := range p.waitQueues {
@@ -1007,6 +1054,15 @@ func (p *AntigravityAcpPool) Close() error {
 	p.mu.Unlock()
 
 	p.finishWorkerRetirements(retirements)
+
+	p.mu.Lock()
+	if p.retiringCount == 0 && !p.retirementsDoneClosed {
+		close(p.retirementsDone)
+		p.retirementsDoneClosed = true
+	}
+	done := p.retirementsDone
+	p.mu.Unlock()
+	<-done
 	return nil
 }
 

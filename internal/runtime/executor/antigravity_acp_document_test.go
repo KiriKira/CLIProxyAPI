@@ -114,15 +114,18 @@ func TestDocumentDirectTitleMarkerIsSupported(t *testing.T) {
 
 func TestDocumentLaneOverflowMapsToRetryable429(t *testing.T) {
 	err := documentLaneBackpressureError(helps.ErrDocumentLaneBusy)
-	status, ok := err.(statusErr)
+	status, ok := err.(requestScopedStatusErr)
 	if !ok {
-		t.Fatalf("lane overflow error type = %T, want statusErr", err)
+		t.Fatalf("lane overflow error type = %T, want requestScopedStatusErr", err)
 	}
 	if status.code != http.StatusTooManyRequests {
 		t.Fatalf("lane overflow status = %d, want %d", status.code, http.StatusTooManyRequests)
 	}
 	if status.retryAfter == nil || *status.retryAfter != time.Second {
 		t.Fatalf("lane overflow retry-after = %v, want 1s", status.retryAfter)
+	}
+	if !status.IsRequestScoped() {
+		t.Fatal("lane overflow must be request-scoped")
 	}
 	if got := documentLaneBackpressureError(context.Canceled); got != context.Canceled {
 		t.Fatalf("non-lane error was remapped: %v", got)

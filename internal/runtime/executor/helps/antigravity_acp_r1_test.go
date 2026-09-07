@@ -36,7 +36,74 @@ func fillToSessionCap(t *testing.T, pool *AntigravityAcpPool, w *AntigravityAcpW
 	}
 }
 
-// TestAntigravityAcpPool_R1SingleWorkerFreshProgressAfterCap is the R1 exit
+func TestAntigravityAcpPool_R1bAsyncRecycleReservesPerKeyCapacity(t *testing.T) {
+	pool := NewAntigravityAcpPoolWithSessionLimits(1, 0, 0, 0, 1, 0, func(context.Context, string) (*acp.Client, error) {
+		return &acp.Client{}, nil
+	})
+	defer func() { _ = pool.Close() }()
+
+	closeStarted := make(chan struct{}, 1)
+	allowClose := make(chan struct{})
+	pool.closeWorkerAndWait = func(context.Context, *acp.Client) error {
+		closeStarted <- struct{}{}
+		<-allowClose
+		return nil
+	}
+
+	w1, err := pool.Acquire(context.Background(), "k1", nil)
+	if err != nil {
+		t.Fatalf("initial acquire: %v", err)
+	}
+	w1.RegisterSessionCreated("session-1", "fresh")
+	table := NewStatefulSessionTable(0, 8)
+	table.Bind("logical-1", "session-1", "auth", "model", w1, 0)
+	pool.Release(w1, true)
+	// Invalidate calls AbandonSession while holding the table lock. The
+	// resulting recycle must defer its finalizer rather than re-entering it.
+	table.Invalidate("logical-1")
+
+	select {
+	case <-closeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("async recycle did not begin process-tree cleanup")
+	}
+
+	spawned := make(chan struct{}, 1)
+	acquired := make(chan *AntigravityAcpWorker, 1)
+	acquireErr := make(chan error, 1)
+	go func() {
+		worker, errAcquire := pool.Acquire(context.Background(), "k1", func(context.Context) (*acp.Client, error) {
+			spawned <- struct{}{}
+			return &acp.Client{}, nil
+		})
+		if errAcquire != nil {
+			acquireErr <- errAcquire
+			return
+		}
+		acquired <- worker
+	}()
+	select {
+	case <-spawned:
+		t.Fatal("same-key replacement spawned before async process cleanup")
+	case <-acquireErr:
+		t.Fatal("same-key acquire failed while retirement was pending")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(allowClose)
+	select {
+	case worker := <-acquired:
+		if worker == w1 {
+			t.Fatal("replacement returned retired worker")
+		}
+		pool.Release(worker, true)
+	case err := <-acquireErr:
+		t.Fatalf("replacement acquire: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement did not start after async cleanup")
+	}
+}
+
 // criterion: maxWorkers=1, maxSessionsPerWorker=1. A worker that reached its
 // session cap while holding a bound document session must not deadlock a
 // fresh-session request; the request receives a replacement worker promptly.

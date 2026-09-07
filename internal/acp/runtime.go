@@ -321,6 +321,7 @@ func (c *Client) reapProcessTree() {
 	defer timer.Stop()
 	<-timer.C
 	_ = killProcessGroup(c.cmd.Process)
+	waitProcessGroupGone(c.cmd.Process)
 }
 
 // isClosed reports whether the client is closed.

@@ -1022,5 +1022,12 @@ func (e statusErr) Error() string {
 	}
 	return fmt.Sprintf("status %d", e.code)
 }
+
 func (e statusErr) StatusCode() int            { return e.code }
 func (e statusErr) RetryAfter() *time.Duration { return e.retryAfter }
+
+// requestScopedStatusErr is used only for executor failures that are tied to
+// the current request rather than the selected credential.
+type requestScopedStatusErr struct{ statusErr }
+
+func (requestScopedStatusErr) IsRequestScoped() bool { return true }

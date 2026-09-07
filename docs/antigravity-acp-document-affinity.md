@@ -39,12 +39,30 @@ Metadata:` / `Title:` prompt form as a compatibility fallback. A request that
 has neither an explicit document ID nor a title is rejected rather than
 creating an ambiguous global binding.
 
+For clients that can provide a machine-only identity block, the executor also
+accepts:
+
+```text
+[[CLIPROXY_ACP_DOCUMENT_TITLE:v1]]
+Example video - YouTube
+[[/CLIPROXY_ACP_DOCUMENT_TITLE]]
+```
+
+The block is removed from the model-facing payload and is not included again
+in the stable semantic fingerprint. Dynamic title/notification context in a
+system or developer message therefore cannot rotate the key, while genuine
+translation-instruction changes still do.
+
 ## Reuse behavior
 
 - The binding key is namespaced by auth identity, client, normalized document
   identity, model variant, source format, and a semantic fingerprint of the
   system/developer configuration.
-- Requests for one key are serialized by a document lane.
+- Requests for one key are serialized by a document lane. The lane has a
+  bounded waiter queue.
+- When the lane queue is full, the executor returns `429 Too Many Requests`
+  with `Retry-After: 1`; this is request-scoped backpressure and must not
+  trigger credential rotation or cooldown.
 - The first request sends the cleaned full payload and binds its ACP session
   only after a successful prompt.
 - A later hit sends only the newest user batch, not prior user/assistant history.

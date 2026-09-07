@@ -313,11 +313,11 @@ func documentLaneBackpressureError(err error) error {
 		return err
 	}
 	retryAfter := time.Second
-	return statusErr{
+	return requestScopedStatusErr{statusErr: statusErr{
 		code:       http.StatusTooManyRequests,
 		msg:        "ACP document lane is busy; retry the request",
 		retryAfter: &retryAfter,
-	}
+	}}
 }
 
 type documentAcquire struct {

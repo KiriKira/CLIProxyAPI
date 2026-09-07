@@ -3,6 +3,7 @@ package helps
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -16,7 +17,7 @@ func TestDocumentLane_GCManyHistoricalKeys(t *testing.T) {
 	table := NewDocumentSessionTable(time.Minute, 10)
 	ctx := context.Background()
 	for i := 0; i < 1000; i++ {
-		key := "document:historical-key"
+		key := fmt.Sprintf("document:historical-key-%d", i)
 		release, err := table.AcquireLane(key, ctx, 0)
 		if err != nil {
 			t.Fatalf("acquire lane %d: %v", i, err)
@@ -55,34 +56,115 @@ func TestDocumentLane_CanceledWaiterExitsPromptly(t *testing.T) {
 	}
 }
 
-// TestDocumentLane_QueueLimitEnforced verifies the bounded queue: with
+func TestDocumentLane_PreCanceledContextNeverAcquires(t *testing.T) {
+	table := NewDocumentSessionTable(time.Minute, 10)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := table.AcquireLane("doc-pre-canceled", ctx, 0); !errors.Is(err, context.Canceled) {
+		t.Fatalf("pre-canceled acquire error = %v, want context.Canceled", err)
+	}
+	if got := table.LaneCount(); got != 0 {
+		t.Fatalf("pre-canceled acquire left %d lanes", got)
+	}
+}
+
+func TestDocumentLane_CancelWinsWhenTokenBecomesAvailable(t *testing.T) {
+	table := NewDocumentSessionTable(time.Minute, 10)
+	release, err := table.AcquireLane("doc-race", context.Background(), 0)
+	if err != nil {
+		t.Fatalf("acquire holder: %v", err)
+	}
+	waitCtx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, acquireErr := table.AcquireLane("doc-race", waitCtx, 0)
+		result <- acquireErr
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		table.mu.Lock()
+		registered := table.lanes["doc-race"] != nil && table.lanes["doc-race"].waiters == 1
+		table.mu.Unlock()
+		if registered {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("waiter did not register")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	release()
+	select {
+	case acquireErr := <-result:
+		if !errors.Is(acquireErr, context.Canceled) {
+			t.Fatalf("canceled simultaneous acquire error = %v, want context.Canceled", acquireErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled simultaneous acquire did not return")
+	}
+	if got := table.LaneCount(); got != 0 {
+		t.Fatalf("canceled simultaneous acquire left %d lanes", got)
+	}
+}
+
 // maxWaiters=2 and one holder, the third concurrent acquire gets
 // ErrDocumentLaneBusy (retryable backpressure) instead of queueing.
 func TestDocumentLane_QueueLimitEnforced(t *testing.T) {
 	table := NewDocumentSessionTable(time.Minute, 10)
-	ctx := context.Background()
-	release, err := table.AcquireLane("doc-b", ctx, 0)
+	release, err := table.AcquireLane("doc-b", context.Background(), 0)
 	if err != nil {
 		t.Fatalf("acquire holder: %v", err)
 	}
-	defer release()
 
-	// Two waiters occupy the queue.
-	for i := 0; i < 2; i++ {
-		waitCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		defer cancel()
-		go func() {
-			r, err := table.AcquireLane("doc-b", waitCtx, 2)
-			if err == nil {
+	waitCtx1, cancel1 := context.WithCancel(context.Background())
+	defer cancel1()
+	waitCtx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	results := make(chan error, 2)
+	for _, waitCtx := range []context.Context{waitCtx1, waitCtx2} {
+		go func(ctx context.Context) {
+			r, acquireErr := table.AcquireLane("doc-b", ctx, 2)
+			if acquireErr == nil {
 				r()
 			}
-		}()
+			results <- acquireErr
+		}(waitCtx)
 	}
-	// Give the waiters a moment to register, then probe the queue limit.
-	time.Sleep(50 * time.Millisecond)
-	_, err = table.AcquireLane("doc-b", ctx, 2)
-	if !errors.Is(err, ErrDocumentLaneBusy) {
+	deadline := time.Now().Add(time.Second)
+	for {
+		table.mu.Lock()
+		registered := table.lanes["doc-b"] != nil && table.lanes["doc-b"].waiters == 2
+		table.mu.Unlock()
+		if registered {
+			break
+		}
+		if time.Now().After(deadline) {
+			release()
+			t.Fatal("queue waiters did not register")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	if _, err = table.AcquireLane("doc-b", context.Background(), 2); !errors.Is(err, ErrDocumentLaneBusy) {
+		release()
 		t.Fatalf("overflow acquire error = %v, want ErrDocumentLaneBusy (R2 bounded queue)", err)
+	}
+	cancel1()
+	cancel2()
+	release()
+	for i := 0; i < 2; i++ {
+		select {
+		case acquireErr := <-results:
+			if !errors.Is(acquireErr, context.Canceled) {
+				t.Fatalf("waiter %d error = %v, want context.Canceled", i, acquireErr)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("waiter %d did not exit", i)
+		}
+	}
+	if got := table.LaneCount(); got != 0 {
+		t.Fatalf("queue test left %d lanes", got)
 	}
 }
 

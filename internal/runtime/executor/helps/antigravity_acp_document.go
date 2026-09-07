@@ -101,6 +101,9 @@ func (t *DocumentSessionTable) AcquireLane(key string, ctx context.Context, maxW
 	if maxWaiters <= 0 {
 		maxWaiters = DefaultDocumentLaneMaxWaiters
 	}
+	if err := ctx.Err(); err != nil {
+		return noRelease, err
+	}
 	t.mu.Lock()
 	lane, ok := t.lanes[key]
 	if !ok {
@@ -125,10 +128,17 @@ func (t *DocumentSessionTable) AcquireLane(key string, ctx context.Context, maxW
 		return noRelease, ctx.Err()
 	}
 
-	// Holding now; no longer a waiter.
+	// Holding now; no longer a waiter. Prefer cancellation over a
+	// simultaneous token-ready select result so a canceled request never
+	// reaches document prompt setup.
 	t.mu.Lock()
 	lane.waiters--
+	canceledErr := ctx.Err()
 	t.mu.Unlock()
+	if canceledErr != nil {
+		t.releaseLaneRef(key, lane, false)
+		return noRelease, canceledErr
+	}
 	return func() { t.releaseLaneRef(key, lane, false) }, nil
 }
 

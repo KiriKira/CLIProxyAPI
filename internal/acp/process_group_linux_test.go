@@ -113,6 +113,9 @@ func TestClientCloseForceKillsProcessGroup(t *testing.T) {
 	if err := client.CloseAndWait(context.Background()); err != nil {
 		t.Fatalf("CloseAndWait: %v", err)
 	}
+	if _, err := os.Stat(fmt.Sprintf("/proc/%d", childPID)); !os.IsNotExist(err) {
+		t.Fatalf("CloseAndWait returned while child process %d still exists (err=%v)", childPID, err)
+	}
 	select {
 	case <-client.ExitErr():
 	case <-time.After(8 * time.Second):
