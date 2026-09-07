@@ -1,110 +1,126 @@
-# ACP Session Lifecycle, Document Affinity, and TTFT Plan
+# ACP Session Lifecycle, Page/Document Affinity, and TTFT Plan
 
 ## Goals
 
 1. Keep warm-path ACP TTFT low.
-2. Make ACP daemon/session/harness resource usage **bounded over time**, including purely stateless traffic.
-3. Preserve stateless OpenAI-compatible semantics by default.
-4. Keep the existing strict opt-in stateful conversation mode for clients that can provide a stable logical session id, monotonic turn number, and full-history recovery source.
-5. Add a second, deliberately different **document-affinity mode** for clients such as Immersive Translate, where one video/article is delivered as many independent translation batches and the client does not send conversational history.
-6. Make the document-affinity design generic enough for YouTube subtitles, long web articles, PDF/EPUB-style chunked translation, and similar segmented workloads.
-7. Never recover throughput by creating an unbounded number of ACP sessions, workers, or `localharness_external` children.
+2. Make ACP daemon/session/harness resource use **bounded over time**, including for fully stateless traffic.
+3. Preserve ordinary stateless OpenAI-compatible behavior unless a client explicitly opts into reuse.
+4. Keep strict stateful conversation reuse for clients that can provide a stable logical session id, monotonic turn number, and full-history recovery source.
+5. Add a separate **page/document-affinity** mode for segmented translation workloads such as Immersive Translate.
+6. Treat one browser tab/document title as the primary affinity unit for the personal Immersive Translate integration, so the same mechanism covers YouTube subtitles and ordinary long articles instead of implementing separate video/article routing.
+7. Prevent article burst concurrency from recreating one-session-per-request growth.
+8. Record the exact Immersive Translate prompt/header changes required from the user before live testing.
 
-The desired steady state for a segmented document is:
+The target behavior is:
 
 ```text
-first batch of document D
-  -> derive/parse stable document key
+first translation batch for page/document D
+  -> derive page/document key from the expanded title context
   -> create or consume one fresh ACP session
-  -> send full system + current batch
-  -> bind document D -> worker + ACP session
+  -> send normal full system prompt + current batch
+  -> bind D -> worker + ACP session
 
-later batch of document D
-  -> same document key
-  -> reacquire the owning worker
-  -> reuse the same ACP session
-  -> send only the new translation batch
+later batch for the same page/document D
+  -> same key
+  -> reacquire owning worker
+  -> reuse same ACP session
+  -> send only the new user translation batch
   -> no session/new
 
-switch to document E
-  -> create/bind a different document session
+switch to page/document E
+  -> bootstrap a different binding/session
 ```
 
-For long documents the session may be rolled over deliberately, but rollover must be bounded and tied into worker recycling so old daemon-side harnesses cannot accumulate forever.
+A long-running document may eventually roll over to a new session, but rollover must participate in the same hard worker/session lifecycle budget so old `localharness_external` processes cannot accumulate forever.
 
 ---
 
-## Current Status and New Evidence
+# 1. Current Evidence and Design Consequences
 
-As of `main` commit `909ede2d88a52edc26c112b7cf02bc994165bfa4`:
+## 1.1 Production resource-growth result
 
-### Already implemented
+The 2026-09-07 Immersive Translate YouTube test showed:
 
-- Persistent authenticated ACP daemon workers.
-- Same-auth multi-worker pool.
-- Per-auth and global worker caps.
-- Corrected TTFT stage instrumentation and `session_mode` logging.
-- Prepared fresh-session cache.
-- Model-aware prepared sessions.
-- Refill/request exclusion.
-- Prompt-build cleanup fixes.
-- Strict opt-in stateful session reuse using:
+- one request roughly every 25-30 seconds;
+- almost every stateless request consumes or creates one new ACP session;
+- observed ACP sessions correspond closely to new `localharness_external` children;
+- old harnesses did not disappear while the daemon remained alive;
+- each old harness retained roughly 40-63 MiB swap in the tested 1 GiB RAM / 2 GiB swap VPS;
+- roughly 37 harnesses consumed about 1.9 GiB swap and produced swap thrashing, high load, TTFT degradation, and 499 timeouts;
+- `prepared-sessions: 1` bounds only the ready-session cache, not the number of sessions/harnesses historically created inside the daemon;
+- `prepared-sessions: 0` removes refill-created sessions but does not fix the underlying one-`session/new`-per-stateless-request lifecycle.
 
-```http
-X-Session-ID: <logical conversation id>
-X-ACP-Session-Reuse: 1
-X-ACP-Session-Turn: <monotonic turn>
+Therefore resource lifecycle remains P0 even if page/document reuse later makes Immersive Translate itself much cheaper.
+
+## 1.2 Immersive Translate identity evidence
+
+Captured requests establish:
+
+- headers contain no current page URL, YouTube video id, Referer, or other dynamic page identifier;
+- the extension `Origin` identifies the client class, not the current page;
+- every request contains title context produced by Immersive Translate's system-prompt variables;
+- the observed expanded prompt contains:
+
+```text
+## Context Awareness
+Document Metadata:
+Title: "<browser tab/page title>"
 ```
 
-- Same-worker reacquisition for bound ACP sessions.
-- TTL/LRU stateful binding table.
-- Incremental newest-turn prompting on a strict stateful hit.
+- subtitle item ids such as `p0`-`p7` restart on every batch and are not usable as cross-request turns;
+- Immersive Translate allows the user to customize system prompts and request headers.
 
-### Newly demonstrated production blocker
+Important correction to the earlier plan:
 
-The Immersive Translate YouTube stress test shows that the current session lifecycle is still unsafe for long-running stateless workloads:
+> Do not require a direct `{{imt_title}}` variable.
 
-- approximately one translation request every 25-30 seconds;
-- almost every request consumes/creates a new ACP session;
-- one ACP session corresponds to a new `localharness_external` child in the observed daemon;
-- old harnesses do not disappear while the daemon stays alive;
-- each old harness leaves roughly 40-63 MiB swapped out in the observed 1 GiB VPS workload;
-- 37 harnesses filled roughly 1.9 GiB swap and caused severe swap thrashing and client timeouts;
-- `prepared-sessions: 1` bounds only the **ready cache**, not the number of sessions/harnesses already created inside the daemon;
-- `prepared-sessions: 0` removes asynchronous refill but does not solve the underlying per-request `session/new` growth for stateless requests.
+The user-confirmed prompt variables include constructs such as:
 
-Therefore session lifecycle/resource safety is now P0 and must be solved before further TTFT micro-optimization.
+```text
+{{title_prompt}}
+{{summary_prompt}}
+{{terms_prompt}}
+{{imt_style_guide}}
+```
 
-### Immersive Translate request identity evidence
+The observed `{{title_prompt}}` expansion already contains the browser-tab/page title. The integration should therefore wrap and parse `{{title_prompt}}` instead of depending on a lower-level title variable that may not be directly exposed in the configured prompt UI.
 
-The captured requests establish the following useful properties:
+## 1.3 Core simplification
 
-- request headers do not contain a video URL, video id, Referer, cookie, or any existing per-video custom header;
-- the browser-extension `Origin` is stable and can identify the client class, but not the current document;
-- the request body contains a stable `Document Metadata -> Title` for all batches of one video/page;
-- YouTube titles may have a changing notification-count prefix such as `(132) ` and a ` - YouTube` suffix;
-- subtitle batches restart their local item ids (`p0`-`p7`) on each request, so those ids are not a cross-request sequence number;
-- Immersive Translate supports custom prompts and custom request headers, so a personal deployment can provide an explicit opt-in signal and a prompt-level document marker instead of relying on a global heuristic.
+Do **not** design separate primary affinity mechanisms for:
 
-This is enough to build document affinity without patching the extension itself.
+- YouTube video subtitles;
+- normal web articles;
+- long-form page translation.
+
+For the personal integration, all are simply segmented translations of the current browser page/document:
+
+```text
+same normalized browser-tab/page title
++ same translation semantic configuration
++ binding still alive/in TTL
+= same document-affinity ACP session
+```
+
+YouTube-specific handling is only an optional normalization detail for unstable tab-title decoration. It is not the core routing model.
 
 ---
 
-# Phase A — P0: Bound the ACP Daemon/Session/Harness Lifecycle
+# 2. P0 — Bound ACP Daemon / Session / Harness Lifecycle
 
-Document reuse reduces session creation dramatically, but it is not a substitute for a hard lifecycle bound. Arbitrary stateless clients must also be safe.
+Document affinity dramatically reduces session creation for Immersive Translate, but arbitrary stateless clients must still be unable to exhaust the VPS.
 
-## A1 — Kill the whole ACP process tree, not only the daemon PID
+## 2.1 Kill the whole ACP process tree
 
-`Client.Close()` currently owns the ACP daemon process, but on Linux the daemon can own `localharness_external` children. Recycling only the parent PID is not a sufficient cleanup contract.
+`Client.Close()` must have a reliable ownership contract over daemon descendants.
 
-Required Linux behavior:
+Linux target:
 
 1. spawn each ACP daemon in its own process group;
-2. graceful close first (stdin EOF / normal daemon exit);
-3. if it does not exit within the grace period, signal the **process group**;
-4. escalate to group `SIGKILL` after the existing hard grace period;
-5. verify no harness child survives as an orphan.
+2. close stdin / request graceful daemon shutdown first;
+3. after the grace period, signal the process group rather than only the direct daemon PID;
+4. escalate to group `SIGKILL` if required;
+5. verify `localharness_external` descendants do not survive as orphans.
 
 Conceptually:
 
@@ -117,129 +133,112 @@ CLIProxyAPI
             -> ...
 
 worker recycle
-  -> terminate ACP process group
-  -> every child disappears
+  -> terminate process group
+  -> reclaim every daemon-side session/harness
 ```
 
-Keep platform-specific process-group handling behind small OS-specific helpers; do not spread syscall conditionals through the ACP client.
+Use small OS-specific process helpers so Unix process-group logic does not leak through the generic ACP client implementation.
 
-### A1 tests
+### Tests
 
-Use a fake agent that deliberately spawns a long-lived child process.
+A fake ACP process should spawn a deliberately long-lived child. Verify:
 
-Verify:
-
-- `Close()` removes the parent and child;
-- forced timeout cleanup removes both;
+- graceful `Close()` removes parent and child;
+- forced cleanup removes parent and child;
 - repeated close is idempotent;
-- no zombie/orphan remains after worker eviction/recycling.
+- no zombie/orphan survives worker recycling.
 
----
+## 2.2 Session lifecycle ledger per worker
 
-## A2 — Track the lifecycle state of every session created on a worker
-
-A simple prepared-cache length is not enough. Track daemon-side session pressure per worker.
+Track daemon-side session pressure explicitly.
 
 Conceptual state:
 
 ```go
 type WorkerSessionStats struct {
-    CreatedTotal      uint64
-    Prepared          int
-    BoundStrict       int
-    BoundDocument     int
-    Abandoned         int
+    CreatedTotal  uint64
+    Prepared      int
+    BoundStrict   int
+    BoundDocument int
+    Abandoned     int
 }
 ```
 
-A session becomes **abandoned** when CLIProxyAPI no longer has any path that can reuse it while the daemon still lives, for example:
+Every successful `session/new`, including background preparation, must be counted exactly once.
 
-- a normal stateless request completes;
-- a strict stateful binding is invalidated/expired/evicted;
-- a document binding is invalidated/expired/rolled over;
-- a prepared session is dropped without being used;
-- a failed/canceled prompt leaves the provider-side session state ambiguous and the binding is discarded.
+A session becomes `Abandoned` when CLIProxyAPI still keeps the daemon alive but no longer has a valid path to reuse that session, including:
 
-Every `session/new`, including background preparation, must be registered exactly once.
+- completed ordinary stateless request;
+- dropped prepared session;
+- strict-stateful binding TTL/LRU/invalidation;
+- document binding TTL/LRU/rollover/invalidation;
+- failed/canceled prompt where provider-side session mutation is ambiguous.
 
-The accounting is a safety ledger, not an assertion that the daemon exposes a usable `session/release` RPC.
+If a prepared session becomes a strict/document-bound session, transition its accounting state; do not count another session.
 
----
+## 2.3 Hard session budgets and worker draining
 
-## A3 — Add hard worker session budgets and a draining state
-
-Initial configuration shape:
+Configuration shape:
 
 ```yaml
 antigravity:
-  max-sessions-per-worker: 0              # 0 = disabled/backward-compatible until validated
-  max-abandoned-sessions-per-worker: 0    # 0 = disabled/backward-compatible until validated
+  max-sessions-per-worker: 0
+  max-abandoned-sessions-per-worker: 0
 ```
 
-For the observed low-memory VPS, the first validation target should be deliberately small (for example 4-8 total/abandoned sessions), then benchmark upward rather than assuming a large default is safe.
+`0` may initially retain backward compatibility until safe measured defaults are chosen.
 
-When a worker reaches a configured budget:
+For the low-memory test VPS, validate deliberately small limits first, e.g. 4-8 sessions per worker.
+
+When a worker reaches a configured hard budget:
 
 ```text
-healthy -> draining
+active -> draining
 ```
 
 A draining worker:
 
-- does not run prepared-session refill;
-- does not create another fresh ACP session;
-- may continue serving already-bound strict/document sessions while that does not increase session count;
-- is not selected for unrelated fresh stateless work;
-- is recycled once a new session would otherwise be required and no safe alternate worker is available;
-- returns its global worker slot only after the worker/process tree has been removed.
+- does not refill prepared sessions;
+- does not create unrelated fresh sessions;
+- may continue already-bound strict/document sessions if reuse does not increase session count;
+- is not selected for fresh stateless traffic;
+- is recycled when another `session/new` would otherwise be required;
+- releases its global worker slot only after process-tree cleanup completes.
 
-For `max-workers: 1`, this naturally becomes a sawtooth lifecycle:
+For a single-worker VPS this gives bounded sawtooth behavior:
 
 ```text
 spawn worker
- -> create bounded number of sessions
+ -> create bounded sessions
  -> drain
- -> kill process group (all harnesses reclaimed)
+ -> terminate daemon + harness tree
  -> spawn replacement
 ```
 
-That converts unbounded growth into a hard upper bound even for clients that never opt into reuse.
+Prepared sessions consume the same hard budget as any other session.
 
-### Important prepared-session rule
+## 2.4 Binding eviction -> abandoned accounting
 
-A prepared session consumes the same daemon-side session budget as any other session.
-
-Do not refill when doing so would cross a hard worker budget. If a prepared session becomes a stateful/document session after its first prompt, change its accounting state rather than counting a second session.
-
----
-
-## A4 — Integrate binding eviction with session accounting
-
-Strict stateful and document bindings keep a daemon session reachable.
-
-When a binding disappears:
+When a strict/document binding disappears while its daemon remains alive:
 
 ```text
 bound session -> abandoned session
 ```
 
-This must happen on:
+Causes include:
 
 - TTL expiry;
 - LRU eviction;
 - model/config mismatch;
+- page/document rollover;
 - cancellation after prompt dispatch;
-- transport failure;
-- explicit rollover;
-- worker retirement.
+- ACP transport ambiguity/failure.
 
-Worker retirement itself clears the ledger because the process group and all daemon-side sessions are gone.
+When the whole worker is retired, its ledger is discarded because all daemon-side sessions/harnesses are physically gone.
 
----
+## 2.5 Lifecycle observability
 
-## A5 — Lifecycle observability
-
-Add structured fields/counters sufficient to prove the bound in production:
+Add structured fields/counters such as:
 
 ```text
 worker_sessions_created
@@ -251,316 +250,36 @@ worker_state=active|draining
 worker_recycle_reason=session_cap|abandoned_cap|idle|dead|shutdown
 ```
 
-Also retain the existing TTFT session mode and extend it later for document reuse.
-
-Do not add Linux `/proc` memory polling to the core logic in the first implementation. Session-count bounds are deterministic and portable; process RSS/swap monitoring remains a diagnostic signal until needed for a second safety layer.
+Do not make Linux `/proc` memory polling part of the first correctness mechanism. Deterministic session caps + process-tree teardown are the primary safety invariant; RSS/swap remains a production diagnostic.
 
 ---
 
-# Phase B — P1: Generic Document-Affinity Session Reuse
+# 3. Two Explicit Reuse Contracts
 
-This phase targets clients that send a document as many independent batches rather than a real chat history.
+Do not conflate real conversational state with segmented document translation.
 
-It is intentionally separate from strict stateful conversations.
+## 3.1 Strict stateful conversation mode
 
-## B0 — Two different continuation contracts
-
-### Strict conversation mode (already implemented)
-
-Properties:
-
-- client provides stable logical id;
-- client provides monotonic turn number;
-- client still sends full history;
-- cache miss can reconstruct the full conversation exactly;
-- duplicate/out-of-order turns are protocol errors/fallback conditions.
-
-### Document-affinity mode (new)
-
-Properties:
-
-- client sends only the current translation batch, not previous batches;
-- the proxy groups batches by a stable document key;
-- the proxy assigns/serializes server-side document turns;
-- on a healthy hit, only the current user batch is appended to the existing ACP session;
-- on binding loss, the next request starts a new document session from the current full request; previous document context is not reconstructable and continuity is therefore opportunistic rather than exact.
-
-That difference must remain explicit in code and naming. Do not silently treat a document stream as a strict conversation.
-
----
-
-## B1 — Explicit wire opt-in, dynamic key from body/prompt
-
-Preferred request contract:
+Existing contract:
 
 ```http
+X-Session-ID: <stable logical conversation id>
 X-ACP-Session-Reuse: 1
-X-ACP-Session-Scope: document
-X-ACP-Client: immersive-translate        # optional diagnostic/profile label
-X-ACP-Document-ID: <stable id>           # optional, preferred when a client can provide one
+X-ACP-Session-Turn: <monotonic turn index>
 ```
 
-Rules:
+Properties:
 
-- `X-ACP-Session-Scope: document` selects the new semantics;
-- `X-ACP-Session-Turn` is **not required** in document mode;
-- if `X-ACP-Document-ID` exists, it is the preferred identity source;
-- if no dynamic header id is available, parse a deliberately formatted prompt marker;
-- if neither explicit id nor marker exists, a configured Immersive Translate fallback may parse `Document Metadata -> Title`;
-- without document scope/explicit opt-in, preserve stateless behavior.
+- client sends full history as recovery source;
+- proxy validates monotonic turn order;
+- healthy hit reuses existing ACP session and sends only the newest turn;
+- worker/session loss can bootstrap exactly from full request history.
 
-Do not globally auto-enable reuse just because a request resembles Immersive Translate.
+Suitable for TranslateNow/chat-like clients.
 
-### Prompt marker
+## 3.2 Page/document-affinity mode
 
-Use a marker that is easy for the proxy to parse and remove before the prompt reaches the model, for example:
-
-```text
-[[CLIPROXY_ACP_DOCUMENT:v1]]
-<document identity text>
-[[/CLIPROXY_ACP_DOCUMENT]]
-```
-
-The marker payload can initially be `{{imt_title}}` for Immersive Translate.
-
-The proxy should strip only the machine marker block, while leaving the normal human-readable title/context prompt intact.
-
-This makes routing metadata non-semantic to the model.
-
----
-
-## B2 — Canonical document key
-
-Build a namespaced hash instead of storing the raw title as the lookup key:
-
-```text
-hash(
-  auth namespace
-  + client profile
-  + scope=document
-  + normalized document id/title
-  + resolved model variant
-  + source/target language when detectable
-  + semantic prompt/config fingerprint
-)
-```
-
-### Immersive Translate title normalization
-
-For the observed YouTube case:
-
-- trim Unicode/ASCII surrounding whitespace;
-- collapse repeated internal whitespace where safe;
-- strip a leading notification counter matching `^\(\d+\)\s*`;
-- strip a trailing ` - YouTube` for the document identity;
-- retain the original title in model-visible document context.
-
-Do not apply YouTube-specific normalization to unrelated clients unless the client profile/document kind says it is appropriate.
-
-### Collision rule
-
-A title is not globally unique.
-
-For the personal Immersive Translate integration, title + auth/client/model/language + idle TTL is acceptable as an initial fallback because the captured request has no URL/video id.
-
-For a general-purpose interface:
-
-1. explicit `X-ACP-Document-ID` wins;
-2. a future URL/video-id/page-id variable should replace title-only identity when available;
-3. title-only fallback must remain opt-in and documented as heuristic.
-
----
-
-## B3 — Reuse the existing ACP session without replaying the system prompt
-
-### First batch / binding miss
-
-Send the normal full request:
-
-```text
-SYSTEM translation instructions + document context
-USER current batch
-```
-
-After successful completion, bind the document key to the worker/session.
-
-### Later batch / binding hit
-
-Reuse the same worker/session and send only the newest user translation batch.
-
-Do not replay the stable system prompt/title/translation instructions on every hit. They are already in the ACP conversation and replaying them wastes tokens and changes context semantics.
-
-The existing newest-user-turn extraction logic can be factored into a shared helper, but strict and document modes must keep separate validation rules.
-
-A document hit should log:
-
-```text
-session_mode=document_reuse
-```
-
-A new document binding can distinguish:
-
-```text
-session_mode=document_bootstrap
-```
-
----
-
-## B4 — Per-document bootstrap singleflight and serialization
-
-This is critical for long articles.
-
-A page translator may issue many requests concurrently. Without a per-document gate, ten simultaneous cold requests can all observe a binding miss and create ten ACP sessions before the first binding is established.
-
-Required invariant:
-
-> At most one lane may bootstrap a given document key at a time unless bounded multi-lane mode has been explicitly enabled.
-
-For the initial one-lane implementation:
-
-```text
-request A (doc D) -> acquires document gate -> bootstraps session
-request B (doc D) -> waits -> sees completed binding -> reuses session
-request C (doc D) -> waits -> reuses session
-```
-
-Different documents must not share the same gate.
-
-Within one document/session, prompts are serialized. Arrival order is the best available order when the client provides no cross-request sequence number.
-
-### Queue bound
-
-Add a configurable bound for waiting document requests. Do not turn overflow into new unbounded ACP sessions.
-
-Possible initial behavior:
-
-- bounded queue;
-- overflow returns a retryable 429/503 rather than silently creating another session;
-- instrument queue wait separately from ACP pool wait.
-
----
-
-## B5 — Bounded multi-lane mode for article bursts
-
-YouTube subtitle traffic is naturally low-rate and should stay on one session lane.
-
-Long articles/PDFs may create enough parallel batches that one 4-10 second ACP generation lane causes unacceptable queueing.
-
-Support an optional bounded lane count per document:
-
-```yaml
-antigravity:
-  document-session-max-lanes: 1   # conservative default
-```
-
-Design:
-
-- lane 1 is canonical and always created first;
-- additional lanes are created only when queue pressure exceeds a configured threshold;
-- never exceed `document-session-max-lanes`;
-- each lane is a separate ACP session and therefore consumes worker session budget;
-- select the least-loaded existing lane for new batches;
-- each lane preserves context for the subset of batches routed through it;
-- resource safety always wins over throughput.
-
-For the personal integration, use one lane for subtitles. Evaluate two lanes for large article translation only if one-lane queue timings show real client timeouts.
-
-If the prompt marker can classify the workload (`subtitle` vs `document`), keep separate lane policies later without hard-coding a web site.
-
----
-
-## B6 — Duplicate/retry protection without a client turn number
-
-Document mode has no monotonic client turn, so retries can otherwise append the same batch twice.
-
-Compute a short-lived batch fingerprint from at least:
-
-```text
-document key
-+ normalized newest-user batch
-+ resolved model/config fingerprint
-```
-
-Maintain a bounded recent-fingerprint cache per document binding.
-
-Desired behavior:
-
-- concurrent identical requests coalesce onto one in-flight prompt when practical;
-- a recently completed identical retry may return the cached translated response instead of appending a duplicate turn;
-- cache size/TTL remains small and bounded;
-- a fingerprint collision must never route across different document keys.
-
-This is especially useful when a browser request times out after the provider already completed the turn.
-
----
-
-## B7 — Document binding lifetime and long-context rollover
-
-One session per entire document eliminates harness growth but can create a different problem: a multi-hour video or very large article can accumulate a large model context.
-
-Track per document lane:
-
-```go
-type DocumentBindingStats struct {
-    Turns                 uint64
-    ApproxInputTokens     uint64
-    ApproxOutputTokens    uint64
-    CreatedAt             time.Time
-    LastUsedAt            time.Time
-}
-```
-
-Configuration shape:
-
-```yaml
-antigravity:
-  document-session-idle-ttl: "0"          # choose after live measurement
-  document-session-max-turns: 0            # 0 = disabled until measured
-  document-session-max-estimated-tokens: 0 # 0 = disabled until measured
-  max-document-sessions: 0                 # separate global/LRU bound if needed
-```
-
-Rollover conditions may include:
-
-- idle TTL expired;
-- max turns reached;
-- estimated context budget reached;
-- incompatible model/system-prompt/language config change;
-- cancellation/transport ambiguity;
-- worker retirement.
-
-On rollover:
-
-1. mark the old binding/session abandoned in the worker ledger;
-2. bootstrap a fresh ACP session from the current request;
-3. bind the same document key to the new session;
-4. let Phase A recycle the worker before abandoned sessions can accumulate beyond its budget.
-
-Do **not** attempt automatic summarization/carry-forward in v1. First make rollover correct and bounded. A small rolling translation-context handoff can be evaluated later if terminology consistency measurably suffers.
-
----
-
-## B8 — Cancellation/error semantics for document mode
-
-Use the same conservative provider-state rule as strict stateful reuse:
-
-- cancellation before `session/prompt` dispatch: keep the binding;
-- cancellation/error after prompt dispatch where provider mutation is ambiguous: invalidate the document binding and mark the session abandoned;
-- ACP transport death: invalidate all bindings owned by that worker;
-- downstream formatting failure after a successfully completed ACP turn: keep the binding and retain the completed batch fingerprint/response if possible;
-- retry of a completed-but-lost response should hit the dedupe cache rather than append the same batch again.
-
-Document mode can continue after invalidation by starting a fresh session, even though previous cross-batch context is lost.
-
----
-
-# Phase C — P1: Immersive Translate Personal Integration
-
-The generic document mode should be implemented in CLIProxyAPI; Immersive Translate only needs configuration.
-
-## C1 — Static opt-in headers
-
-Immersive Translate supports custom request headers. Configure the personal OpenAI-compatible service to send static metadata similar to:
+New contract:
 
 ```http
 X-ACP-Session-Reuse: 1
@@ -568,166 +287,482 @@ X-ACP-Session-Scope: document
 X-ACP-Client: immersive-translate
 ```
 
-Do not rely on a dynamic page id in the header unless Immersive Translate is proven to interpolate page variables there. Static headers are sufficient because the dynamic identity is carried in the prompt.
+Optional future field:
 
-This also avoids hard-coding the extension id or browser User-Agent in CLIProxyAPI.
+```http
+X-ACP-Document-ID: <real URL/page/video/document id>
+```
+
+Properties:
+
+- client sends only the current translation batch, not prior batches;
+- proxy groups requests by a page/document identity extracted from the current request;
+- proxy serializes/assigns ordering itself;
+- healthy hit sends only the current user batch into the already-live ACP session;
+- binding loss bootstraps a fresh session from the current request only;
+- lost previous translation context is acceptable recovery behavior because the client did not supply reconstructable history.
+
+`X-ACP-Session-Turn` is not required for document mode.
+
+The static opt-in headers prevent accidental reuse for arbitrary OpenAI-compatible clients.
 
 ---
 
-## C2 — Add a machine-readable document marker to the custom prompt
+# 4. Page/Document Identity
 
-Immersive Translate exposes `{{imt_title}}` through its prompt/env machinery and already injects title context.
+## 4.1 Personal Immersive Translate rule
 
-Modify the personal prompt/env so every translation request also carries a marker such as:
+Primary initial identity source:
+
+> the browser-tab/page title contained in the expanded `{{title_prompt}}` block.
+
+The same page title therefore naturally groups:
+
+- all batches of one YouTube subtitle translation;
+- all batches of one normal article;
+- all batches of a long page/document translation;
+- other segmented translations generated from the same browser tab/page.
+
+No `subtitle` versus `article` classifier is required for basic affinity.
+
+## 4.2 Machine-readable marker around `{{title_prompt}}`
+
+The user will later modify the Immersive Translate system prompt so CLIProxyAPI can locate the title context deterministically.
+
+Recommended form:
 
 ```text
-[[CLIPROXY_ACP_DOCUMENT:v1]]
-{{imt_title}}
-[[/CLIPROXY_ACP_DOCUMENT]]
+[[CLIPROXY_ACP_TITLE_PROMPT:v1]]
+{{title_prompt}}
+[[/CLIPROXY_ACP_TITLE_PROMPT]]
+
+{{summary_prompt}}{{terms_prompt}}{{imt_style_guide}}
 ```
 
-Keep the existing human-readable `Document Metadata -> Title` too.
+If the user's existing system prompt has additional translation instructions, keep them unchanged around this block. Only replace the existing bare `{{title_prompt}}` occurrence with the wrapped version.
 
-For future configuration, optionally add a second stripped marker for workload kind:
+Important forwarding behavior:
+
+1. CLIProxyAPI locates the marker block.
+2. After Immersive Translate expands `{{title_prompt}}`, CLIProxyAPI parses the page title from the enclosed content.
+3. CLIProxyAPI removes **only the two marker delimiter lines**.
+4. The actual expanded `title_prompt` content remains in the system prompt forwarded to ACP/model.
+
+Therefore the marker supplies routing metadata without removing useful title context from the model and without duplicating `{{title_prompt}}`.
+
+Expected expanded shape:
 
 ```text
-[[CLIPROXY_ACP_DOCUMENT_KIND:subtitle]]
+[[CLIPROXY_ACP_TITLE_PROMPT:v1]]
+## Context Awareness
+Document Metadata:
+Title: "Some Page Title"
+[[/CLIPROXY_ACP_TITLE_PROMPT]]
 ```
 
-or
+Proxy routing key material:
 
 ```text
-[[CLIPROXY_ACP_DOCUMENT_KIND:article]]
+Some Page Title
 ```
 
-Because Immersive Translate has separate subtitle and multi-paragraph prompts, this can distinguish low-rate subtitles from bursty page/article translation without relying on URL-specific code.
+Model-visible text after marker removal:
 
-The proxy strips these machine markers before forwarding the prompt to ACP.
+```text
+## Context Awareness
+Document Metadata:
+Title: "Some Page Title"
+```
 
----
+## 4.3 Exact user-side changes to perform later
 
-## C3 — Existing-title fallback for immediate testing
+Record these now so the live-test step is reproducible.
 
-Before the custom prompt is deployed, document mode may support a narrowly gated fallback parser for the already observed text:
+### Request headers
+
+In the Immersive Translate custom OpenAI-compatible service, add:
+
+```http
+X-ACP-Session-Reuse: 1
+X-ACP-Session-Scope: document
+X-ACP-Client: immersive-translate
+```
+
+These can be static headers. No dynamic title/page value needs to be interpolated into a header.
+
+### System prompt
+
+Find the existing use of:
+
+```text
+{{title_prompt}}
+```
+
+and change it to:
+
+```text
+[[CLIPROXY_ACP_TITLE_PROMPT:v1]]
+{{title_prompt}}
+[[/CLIPROXY_ACP_TITLE_PROMPT]]
+```
+
+Keep the other existing variables, including for example:
+
+```text
+{{summary_prompt}}
+{{terms_prompt}}
+{{imt_style_guide}}
+```
+
+in their existing semantic positions.
+
+A minimal combined template is:
+
+```text
+[[CLIPROXY_ACP_TITLE_PROMPT:v1]]
+{{title_prompt}}
+[[/CLIPROXY_ACP_TITLE_PROMPT]]
+{{summary_prompt}}{{terms_prompt}}
+{{imt_style_guide}}
+```
+
+Do **not** make the user add a separate `{{imt_title}}` dependency unless a later test proves that variable is directly available and more reliable in the relevant Immersive Translate prompt configuration.
+
+### Migration/fallback
+
+For initial A/B testing, CLIProxyAPI may also parse the old unmarked expanded form:
 
 ```text
 Document Metadata:
 Title: "..."
 ```
 
-or the equivalent localized/title quoting forms used by Immersive Translate.
+but only when document scope is explicitly opted in (or behind a dedicated personal-client compatibility flag).
 
-Only use this fallback when:
+Once the wrapped prompt is confirmed working, the explicit marker should be preferred because it avoids accidentally interpreting unrelated `Title:` text inside arbitrary prompts.
 
-- document scope was explicitly requested; or
-- a dedicated `immersive-translate-auto-document-session` config flag is enabled.
+## 4.4 Canonical key
 
-Never use generic `Title:` text in arbitrary prompts as an automatic session key.
+Do not use the raw title alone as a global map key.
 
----
-
-## C4 — YouTube-specific behavior
-
-For the captured video:
+Conceptually:
 
 ```text
-(132) <video title> - YouTube
+hash(
+  auth namespace
+  + client profile
+  + scope=document
+  + normalized page/document title
+  + resolved model variant
+  + source/target language when available
+  + semantic translation-prompt/config fingerprint
+)
 ```
 
-normalize to:
+This prevents a page translated with different language/model/prompt semantics from accidentally inheriting incompatible ACP context.
+
+## 4.5 Title normalization
+
+Core behavior should be generic and conservative:
+
+- Unicode/ASCII trim;
+- normalize obvious surrounding whitespace;
+- optionally collapse clearly irrelevant repeated whitespace.
+
+Do **not** define YouTube video-title extraction as the identity algorithm.
+
+The captured value such as:
 
 ```text
-<video title>
+(132) <page/video title> - YouTube
 ```
 
-so a changing notification counter does not split one video into multiple ACP sessions.
+is a **browser tab title**.
 
-Expected live behavior:
+A known site may decorate that tab title with volatile UI state. For example, YouTube may prepend a changing notification counter such as `(132) `.
+
+Optional client/site-profile normalization may remove only known volatile decoration such as:
+
+```regex
+^\(\d+\)\s*
+```
+
+for YouTube pages, so notification-count changes do not split a session.
+
+The stable ` - YouTube` suffix does not have to be removed; retaining it can actually help namespace otherwise-similar titles. Site-specific normalization is an optional refinement, not a prerequisite for document affinity.
+
+## 4.6 Collision limitations
+
+Two unrelated pages can share the same tab title (`Home`, `Index`, etc.).
+
+For this personal integration, the following combination is initially acceptable:
 
 ```text
-video A batch 1 -> document_bootstrap -> session X
-video A batch 2 -> document_reuse     -> session X
-video A batch N -> document_reuse     -> session X
-video B batch 1 -> document_bootstrap -> session Y
+title + auth/client namespace + model/language/config fingerprint + idle TTL
 ```
 
-The harness count should therefore remain roughly proportional to the small number of concurrently active documents/lanes, not the number of subtitle batches watched.
+because it drastically reduces practical collision risk and the user controls the endpoint.
+
+Long term preference order:
+
+1. real explicit `X-ACP-Document-ID` derived from URL/page/video/document identity;
+2. a future prompt variable exposing URL/page id;
+3. title-based affinity as the personal compatibility fallback.
+
+Never claim title-only identity is universally collision-free.
 
 ---
 
-## C5 — Long article behavior
+# 5. Reusing the ACP Session
 
-The same mechanism must work without YouTube assumptions:
+## 5.1 First batch / miss
+
+For a new page key:
 
 ```text
-article title/key D
-  paragraph batch 1 -> lane/session D1
-  paragraph batch 2 -> reuse D1
-  ...
+normal full SYSTEM prompt
++ title/summary/terms/style context
++ current USER translation batch
 ```
 
-If Immersive Translate sends many article batches at once:
+Create or consume one fresh prepared ACP session.
 
-- cold-start singleflight prevents one-session-per-request fan-out;
-- the per-document queue provides backpressure;
-- optional bounded lanes provide controlled throughput;
-- every lane still counts toward the hard worker session budget;
-- title collision risk remains documented until a URL/page-id marker is available.
+Only bind the page/document key after the first prompt succeeds.
 
-This article case is part of the initial acceptance test, not a later afterthought.
+Log:
 
----
+```text
+session_mode=document_bootstrap
+```
 
-# Phase D — P2: Tests and Production Exit Criteria
+## 5.2 Later batch / hit
 
-## D1 — Lifecycle regression tests
+For a healthy binding with the same semantic key:
 
-Required fake-agent/process tests:
+- reacquire the same worker/client that owns the ACP session;
+- do not call `session/new`;
+- do not replay the full system prompt;
+- send only the newest user translation batch.
 
-1. Stateless requests cannot make one worker exceed the configured session cap.
-2. Prepared refill stops at the worker cap.
-3. Dropped prepared sessions increase abandoned accounting.
-4. Stateful/document binding eviction increases abandoned accounting.
-5. Draining worker does not accept a new session.
-6. Worker recycle kills daemon + child process tree.
-7. Global/per-auth worker limits remain correct while workers drain/recycle.
-8. No race leaks worker slots or session ledger entries.
+Log:
 
----
+```text
+session_mode=document_reuse
+```
 
-## D2 — Document-affinity functional tests
+This should both:
 
-Required request-level tests:
+- stop one-harness-per-translation-batch growth;
+- preserve useful cross-batch context such as terminology/person names/tone;
+- avoid repeatedly sending the same system/title/summary/terms prompt into the model context.
 
-1. First document request bootstraps exactly one ACP session.
-2. Second request with the same document key performs no `session/new` and sends only the new user batch.
-3. Different document key creates a different binding.
-4. Missing document opt-in preserves stateless behavior.
-5. Model/language/system-prompt fingerprint change rotates the document binding.
-6. Idle TTL/turn/token rollover creates a fresh binding and marks the old session abandoned.
-7. Cancellation after dispatch invalidates the binding.
-8. Worker death invalidates all document bindings on that worker.
-9. Duplicate completed batch is not appended twice.
-10. Concurrent identical batch coalesces when dedupe singleflight is enabled.
-11. Concurrent cold requests for one document create one lane/session in one-lane mode.
-12. Queue overflow never falls back to unbounded session creation.
-13. Optional two-lane mode never creates a third lane.
+Strict conversation mode and document mode may share incremental newest-user extraction helpers, but their validation/recovery semantics must remain separate.
 
 ---
 
-## D3 — Immersive Translate live acceptance test: YouTube
+# 6. Concurrency: Long Articles Must Not Fan Out Sessions
 
-Repeat the original long-running subtitle test.
+The article case is part of the first design, not a future edge case.
+
+## 6.1 Cold-start singleflight per document
+
+A long page may cause many batches to arrive nearly simultaneously.
+
+Without a per-key gate:
+
+```text
+10 requests
+ -> all see binding miss
+ -> 10 session/new
+ -> 10 harnesses
+```
+
+Required invariant in one-lane mode:
+
+> Only one request may bootstrap a given document key.
+
+Example:
+
+```text
+A(doc D) -> acquire document gate -> session/new -> bind D
+B(doc D) -> wait
+C(doc D) -> wait
+B/C       -> observe binding -> reuse same session
+```
+
+Different page/document keys use independent gates.
+
+## 6.2 Serialize prompts within one lane
+
+An ACP session is one ordered context. Requests routed to the same document lane must prompt it serially.
+
+If the client has no cross-request sequence id, arrival/gate order is the best available ordering.
+
+## 6.3 Bounded queue/backpressure
+
+Do not handle queue pressure by silently bootstrapping more sessions without limit.
+
+Use a bounded queue per document/lane and expose queue-wait metrics.
+
+If the queue limit is exceeded, return a retryable 429/503 (or another explicitly chosen backpressure behavior) rather than generating unbounded ACP sessions.
+
+## 6.4 Optional bounded multi-lane mode
+
+One lane is the conservative default because it maximizes context consistency and minimizes harness count.
+
+For large articles, one lane may be too slow if individual ACP generations take several seconds and the extension emits many batches in parallel.
+
+Optional configuration:
+
+```yaml
+antigravity:
+  document-session-max-lanes: 1
+```
+
+If measurement later justifies >1:
+
+- create additional lanes only under queue pressure;
+- never exceed the configured lane cap;
+- each lane is a real ACP session and consumes the worker session budget;
+- route new batches to the least-loaded existing lane;
+- each lane keeps context only for its own subset of batches;
+- resource safety wins over throughput.
+
+Do not require explicit `subtitle`/`article` markers in v1. If later measurements justify different default lane policies, workload classification can be added separately.
+
+---
+
+# 7. Duplicate / Retry Protection
+
+Document mode lacks the strict client's monotonic turn index.
+
+A timed-out browser request may be retried after ACP already processed it, which could append the same batch twice.
+
+Compute a bounded short-lived fingerprint from at least:
+
+```text
+document key
++ normalized newest-user batch
++ resolved model/config fingerprint
+```
+
+Maintain a small recent fingerprint/response cache per document binding.
+
+Desired behavior:
+
+- concurrent identical requests coalesce when practical;
+- a recently completed identical retry returns the cached translated result instead of appending another ACP turn;
+- cache size and TTL remain bounded;
+- fingerprints never dedupe across document keys.
+
+---
+
+# 8. Binding Lifetime and Very Long Documents
+
+One session per current page fixes harness growth but can make a multi-hour video or very large article accumulate a large ACP/model context.
+
+Track per lane:
+
+```go
+type DocumentBindingStats struct {
+    Turns              uint64
+    ApproxInputTokens  uint64
+    ApproxOutputTokens uint64
+    CreatedAt          time.Time
+    LastUsedAt         time.Time
+}
+```
+
+Configuration shape to evaluate after measurement:
+
+```yaml
+antigravity:
+  document-session-idle-ttl: "0"
+  document-session-max-turns: 0
+  document-session-max-estimated-tokens: 0
+  max-document-sessions: 0
+```
+
+Possible rollover causes:
+
+- idle TTL expired;
+- maximum turns reached;
+- estimated context budget reached;
+- model/language/system-prompt semantic fingerprint changed;
+- cancellation/transport ambiguity;
+- worker retirement.
+
+Rollover sequence:
+
+1. old binding/session becomes abandoned in the worker ledger;
+2. current request bootstraps a fresh session;
+3. same page/document key points to the new session;
+4. P0 hard session budgets ensure abandoned old harnesses cannot accumulate indefinitely before worker recycle.
+
+Do not add automatic context summarization/carry-forward in v1. First make rollover safe and measurable.
+
+---
+
+# 9. Cancellation and Failure Semantics
+
+Document mode uses conservative provider-state rules:
+
+- canceled before `session/prompt` dispatch: keep binding;
+- canceled/failed after prompt dispatch with ambiguous provider mutation: invalidate binding and mark session abandoned;
+- ACP worker/transport death: invalidate all strict/document bindings owned by that worker;
+- downstream formatting failure after ACP completed successfully: keep binding if provider-side state is known good;
+- completed-but-lost response should be recoverable from the short-lived batch response cache when possible.
+
+On document-binding loss, the next batch can always start a fresh session. Exact previous-context reconstruction is not promised because Immersive Translate did not send previous batches.
+
+---
+
+# 10. Tests and Production Exit Criteria
+
+## 10.1 Lifecycle regression tests
+
+1. Stateless loops cannot exceed configured worker session cap.
+2. Prepared refill stops before crossing a hard session cap.
+3. Dropped prepared sessions enter abandoned accounting.
+4. Strict/document binding eviction enters abandoned accounting.
+5. Draining workers do not accept a new session.
+6. Worker recycle kills daemon and child harness tree.
+7. Global/per-auth worker caps remain correct during draining/replacement.
+8. Race tests show no leaked worker slots or session ledger entries.
+
+## 10.2 Document-affinity functional tests
+
+1. First page request bootstraps exactly one ACP session.
+2. Second request with same normalized title/config performs no `session/new`.
+3. Hit sends only newest user translation batch.
+4. Different title creates a different binding.
+5. Same title under a different model/language/prompt semantic fingerprint does not reuse incompatible context.
+6. Missing document opt-in stays stateless.
+7. Prompt marker is removed while expanded `title_prompt` remains model-visible.
+8. Unmarked `Document Metadata -> Title` fallback works only when explicitly enabled.
+9. Binding TTL/rollover marks old session abandoned.
+10. Cancellation after dispatch invalidates binding.
+11. Worker death invalidates every binding on that worker.
+12. Duplicate completed batch is not appended twice.
+13. Concurrent identical batch coalesces when enabled.
+14. Concurrent cold requests for one page create one session in one-lane mode.
+15. Queue overflow never creates an unbounded fallback session.
+16. Optional two-lane mode never creates lane 3.
+
+## 10.3 Immersive Translate YouTube soak test
+
+Repeat the original subtitle workload well beyond the previous ~25-minute collapse window.
 
 Exit criteria:
 
-- same normalized video title repeatedly logs `document_reuse` after the first batch;
-- `session/new` count for the video remains 1 per active lane until an intentional rollover/recycle;
-- harness count does not grow linearly with subtitle request count;
-- swap usage reaches a stable bounded range rather than monotonic growth;
-- no 20-30 minute functional collapse;
-- changing to another video creates a separate document binding;
-- changing the YouTube notification counter prefix does not create a new binding.
+- first batch logs `document_bootstrap`;
+- later batches with the same page/tab title log `document_reuse`;
+- `session/new` count remains one per active lane until intentional rollover/recycle;
+- harness count no longer grows with subtitle batch count;
+- swap reaches a bounded/stable range rather than monotonic growth;
+- changing to another YouTube page/title creates a separate binding;
+- if notification count `(N)` changes, optional YouTube decoration normalization prevents unnecessary session split;
+- translation remains responsive for substantially longer than the original failure window.
 
 Collect TTFT distributions for:
 
@@ -739,95 +774,123 @@ document_reuse
 stateful_reuse
 ```
 
-Document reuse should also reduce repeated system-prompt token traffic, not only session creation.
+## 10.4 Immersive Translate long-article burst test
 
----
-
-## D4 — Immersive Translate live acceptance test: long article
-
-Use a long article large enough to produce many translation batches, preferably with enough initial concurrency to exercise cold-start races.
+Use a page large enough to generate many translation requests and enough initial concurrency to exercise a cold-start race.
 
 Exit criteria:
 
-- one-lane mode creates only one initial document session despite concurrent first requests;
-- queued batches continue reusing the bound session;
+- all batches with the same tab/page title group into the same document binding in one-lane mode;
+- concurrent first requests produce one bootstrap, not N sessions;
+- queued requests reuse the bound session;
 - queue wait is observable and bounded;
-- if one-lane translation causes client timeout, test a bounded two-lane policy and compare completion time/context consistency;
 - session/harness count remains bounded by lane + worker lifecycle limits;
-- after switching articles, the old binding expires or is evicted according to policy rather than growing forever.
+- if one lane causes extension timeouts, compare an explicitly bounded two-lane configuration;
+- switching to another article creates another binding while the old one eventually expires/evicts instead of remaining forever.
 
 ---
 
-# Phase E — P3: Remaining TTFT/Serialization Micro-Optimizations
-
-Only return to these after lifecycle safety and document reuse are proven.
-
-Candidates retained from the earlier plan:
-
-- single-pass outbound ACP JSON encoding;
-- reduce repeated session-update decoding;
-- other allocation/copy reductions shown to matter by corrected stage timings.
-
-Do not prioritize these while backend generation or session/harness lifecycle dominates the user-visible result.
-
----
-
-# Implementation Order
+# 11. Implementation Order
 
 ## Step 1 — Process-tree cleanup
 
-Implement process-group spawn/termination and prove a worker recycle removes `agy_acp_server.par` plus every harness child.
+Implement process-group spawn/termination and prove worker recycle removes `agy_acp_server.par` and all harness descendants.
 
-**Exit criterion:** fake child-process test is deterministic and green.
+**Exit criterion:** deterministic fake child-process tests pass.
 
 ## Step 2 — Worker session ledger + hard caps + draining
 
-Add total/abandoned accounting, prepared-session integration, draining selection rules, and recycle behavior.
+Integrate fresh/prepared/strict/document session accounting and bounded worker recycling.
 
-**Exit criterion:** a synthetic stateless loop can run indefinitely without exceeding the configured per-worker session bound.
+**Exit criterion:** indefinite synthetic stateless traffic cannot exceed configured daemon-side session pressure.
 
 ## Step 3 — Generic document-affinity core
 
-Add document scope parsing, explicit id/prompt-marker extraction, canonical keying, binding table, per-document singleflight/serialization, incremental user-batch prompting, cancellation semantics, and logs.
+Implement:
 
-**Exit criterion:** 50 sequential batches with one document key perform one `session/new` in one-lane mode.
+- document-scope header parsing;
+- `title_prompt` marker extraction;
+- page-title parsing;
+- semantic canonical key;
+- binding table;
+- same-worker reacquisition;
+- per-document bootstrap singleflight;
+- serialized prompt queue;
+- incremental user-batch prompting;
+- cancellation/invalidation;
+- document reuse logging.
 
-## Step 4 — Immersive Translate prompt/header configuration
+**Exit criterion:** 50 sequential batches with one title/config perform one `session/new` in one-lane mode.
 
-Add the static opt-in headers and title marker to the personal client configuration. Keep title parsing fallback available for A/B testing.
+## Step 4 — User modifies Immersive Translate configuration
 
-**Exit criterion:** captured live requests expose a stable normalized document key without changing translation output format.
+Apply the exact recorded changes from section 4.3:
+
+Headers:
+
+```http
+X-ACP-Session-Reuse: 1
+X-ACP-Session-Scope: document
+X-ACP-Client: immersive-translate
+```
+
+Prompt wrapper:
+
+```text
+[[CLIPROXY_ACP_TITLE_PROMPT:v1]]
+{{title_prompt}}
+[[/CLIPROXY_ACP_TITLE_PROMPT]]
+```
+
+Keep `{{summary_prompt}}`, `{{terms_prompt}}`, `{{imt_style_guide}}`, and the rest of the translation prompt semantics unchanged.
+
+**Exit criterion:** live captured request produces a deterministic page-title key and unchanged translation output structure.
 
 ## Step 5 — YouTube soak test
 
-Run long enough to exceed the previous ~25-minute failure window by a wide margin.
+Run well past the old failure horizon.
 
-**Exit criterion:** harness/swap usage is bounded and translation remains responsive.
+**Exit criterion:** bounded harness/swap usage and stable translation.
 
 ## Step 6 — Long article burst test
 
-Validate cold-start singleflight, queueing, and optional bounded multi-lane behavior.
+Validate title affinity, bootstrap singleflight, queueing, dedupe, and optional bounded lanes.
 
-**Exit criterion:** article translation cannot recreate one-session-per-request growth even under burst concurrency.
+**Exit criterion:** article translation cannot recreate one-session-per-request growth under concurrency.
 
-## Step 7 — Add document rollover limits from measurement
+## Step 7 — Tune TTL / rollover / lane defaults from measurement
 
-Use observed context size, memory, TTFT, and translation consistency to choose practical defaults for idle TTL, max turns/tokens, lane count, and low-memory worker session caps.
+Choose practical values only after observing:
 
-**Exit criterion:** multi-hour video/very long document use remains bounded without unacceptable context degradation.
+- context growth;
+- translation consistency;
+- queue wait;
+- TTFT;
+- harness count;
+- RAM/swap behavior.
 
-## Step 8 — Only then resume micro-optimization
+## Step 8 — Resume micro-optimization only if useful
 
-If `backend_to_first_output_ms` still dominates, stop. Do not add complexity for sub-millisecond proxy savings.
+Possible remaining work:
+
+- single-pass outbound ACP JSON encoding;
+- reduce repeated session-update decoding;
+- other allocation/copy improvements justified by corrected TTFT stages.
+
+If backend generation dominates, stop rather than adding complexity for insignificant proxy-side savings.
 
 ---
 
-# Non-Goals / Guardrails
+# 12. Guardrails / Non-Goals
 
-- Do not reuse prompted sessions for arbitrary clients without explicit opt-in.
-- Do not infer document identity globally from any random `Title:` text.
-- Do not rely on title-only identity as a universal solution; it is an explicitly accepted personal-client fallback until a real URL/page id is available.
-- Do not let article concurrency bypass resource limits by silently spawning unlimited lanes/sessions.
-- Do not make `prepared-sessions: 0` the claimed fix for the leak; it only changes when `session/new` occurs.
-- Do not assume a usable ACP `session/release` exists unless verified against the actual Antigravity daemon. If a reliable release/dispose RPC is discovered later, integrate it and reduce the need for worker recycling.
-- Do not sacrifice stateless compatibility for clients that do not opt into strict/document reuse.
+- Do not auto-reuse prompted sessions for arbitrary clients without explicit opt-in.
+- Do not treat document mode as an exactly recoverable conversation.
+- Do not require a direct `{{imt_title}}` variable for the initial Immersive Translate integration.
+- Do not split the core design into separate YouTube-video versus article affinity mechanisms; both are page/document title affinity.
+- Do not interpret arbitrary `Title:` text globally; marker or explicit compatibility mode must gate parsing.
+- Do not claim raw title alone is globally unique.
+- Do not let article concurrency bypass worker/session budgets by spawning unlimited lanes.
+- Do not claim `prepared-sessions: 0` fixes the session/harness lifecycle problem.
+- Do not assume a usable ACP `session/release` exists unless verified against the actual Antigravity daemon.
+- If a reliable daemon-side session dispose/release RPC is later discovered, integrate it and reduce reliance on whole-worker recycling.
+- Preserve stateless compatibility for clients that do not opt into strict/document reuse.
