@@ -107,6 +107,16 @@ func NewAntigravityAcpExecutor(cfg *internalconfig.Config) *AntigravityAcpExecut
 			prepareLimit = antigravityPreparedSessionsPerWorker
 		}
 		exec.pool = helps.NewAntigravityAcpPoolWithSessionLimits(maxWorkers, maxTotal, prepareLimit, idleTimeout, maxSessionsPerWorker, maxAbandonedPerWorker, nil)
+		// R1: when the pool force-retires an idle draining worker (or
+		// evicts/expires one), every strict/document binding owned by that
+		// worker must be purged so clients bootstrap from full history
+		// instead of reacquiring a dead worker. The hook runs without pool
+		// locks; the binding tables take their own locks and call back into
+		// the pool via AbandonSession.
+		exec.pool.SetWorkerRetiredHook(func(w *helps.AntigravityAcpWorker) {
+			exec.stateful.PurgeWorker(w)
+			exec.document.PurgeWorker(w)
+		})
 
 		// Opt-in stateful session reuse (Phase 1). TTL/bound come from the
 		// antigravity config; zero values keep the defaults.

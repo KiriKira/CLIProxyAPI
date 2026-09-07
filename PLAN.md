@@ -48,6 +48,24 @@ worker reaches hard session pressure
 
 Reviewed branch head: `ee3b2605a9e93bb4f3a162751ec582cbcbf80cc5`.
 
+### Implementation status (updated after R1 fix)
+
+- **R1 — FIXED.** `forceRetireIdleDrainingLocked` in
+  `internal/runtime/executor/helps/antigravity_acp_pool.go` retires the least
+  recently used **idle draining** worker of the key (ignoring its bindings)
+  right before the fresh acquirer would join the wait queue; the retirement
+  removes the worker, returns its global slot, purges strict/document
+  bindings through the `SetWorkerRetiredHook` registered by the executor
+  (both binding tables), wakes same-key waiters, and closes the ACP client.
+  `Release` of a draining worker now wakes queued waiters so the escape
+  hatch runs promptly even when the cap was hit while a prompt was in
+  flight. Forced retirement never touches `inUse` workers. The cross-key
+  eviction and idle-expiry paths also purge bindings now. Tests:
+  `antigravity_acp_r1_test.go` (pool level: single-worker fresh progress,
+  hook purge, never-in-use, evicted-bound purge; executor level: both
+  binding tables emptied and lookups fail after forced retirement).
+- R2-R8: not started; order below is unchanged.
+
 The branch contains the right overall direction:
 
 - Unix ACP process-group ownership and TERM/KILL escalation;
@@ -815,11 +833,11 @@ Exit criteria:
 
 ## Step 1 — Fix R1 fresh-demand forward progress
 
-This is the current hard blocker.
+This is the current hard blocker. **Status: implemented, tests green.**
 
 Add forced retirement of an **idle draining** worker when fresh-session demand otherwise cannot obtain a worker slot. Purge bindings and spawn replacement.
 
-**Exit criterion:** `maxWorkers=1` cannot deadlock after reaching a session cap while holding a bound document/stateful session.
+**Exit criterion:** `maxWorkers=1` cannot deadlock after reaching a session cap while holding a bound document/stateful session. *(Met by `TestAntigravityAcpPool_R1SingleWorkerFreshProgressAfterCap`; the full live VPS soak in Step 8 remains the production confirmation.)*
 
 ## Step 2 — Fix R4 late-hit fallback correctness
 
