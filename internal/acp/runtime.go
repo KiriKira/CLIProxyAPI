@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
 	"sync"
 	"sync/atomic"
@@ -20,8 +19,11 @@ import (
 const maxACPMessageBytes = 8 * 1024 * 1024
 
 // closeKillGrace bounds how long Close waits (without blocking) before
-// killing a still-running agent process so it can never become a zombie.
+// asking the agent process group to terminate after stdin EOF.
 const closeKillGrace = 5 * time.Second
+
+// closeKillEscalationGrace bounds the SIGTERM-to-SIGKILL escalation window.
+const closeKillEscalationGrace = time.Second
 
 // clientLogFunc receives agent stderr lines. Implementations must not log
 // them verbatim: upstream stderr can contain OAuth URLs, states, and
@@ -98,6 +100,9 @@ type Client struct {
 	closed   bool
 	closeErr error
 	exitCh   chan error
+	// processDone closes when cmd.Wait returns. It is separate from exitCh so
+	// the background process-group reaper does not consume the public result.
+	processDone chan struct{}
 
 	logStderr clientLogFunc
 }
@@ -144,6 +149,9 @@ func NewClient(cfg SpawnConfig) (*Client, error) {
 		cmd.Dir = cfg.Dir
 	}
 	cmd.Env = append([]string(nil), cfg.Env...)
+	// Run each ACP daemon in its own process group so Close can reclaim
+	// daemon-spawned harness descendants as one lifecycle unit.
+	configureProcessGroup(cmd)
 	// Portable kill for future CommandContext use and hung processes.
 	cmd.Cancel = func() error { return cmd.Process.Kill() }
 	cmd.WaitDelay = closeKillGrace
@@ -166,8 +174,11 @@ func NewClient(cfg SpawnConfig) (*Client, error) {
 
 	c := newClientWithPipes(stdinPipe, stdoutPipe, stderrPipe, cfg.LogStderr, cfg.OnUpdate)
 	c.cmd = cmd
+	c.processDone = make(chan struct{})
 	go func() {
-		c.exitCh <- cmd.Wait()
+		err := cmd.Wait()
+		c.exitCh <- err
+		close(c.processDone)
 		c.failAllPending(transportErrorf("agent process exited"))
 	}()
 	return c, nil
@@ -250,17 +261,32 @@ func (c *Client) Close() error {
 	c.closedMu.Unlock()
 	c.failAllPending(transportErrorf("client closed"))
 	if c.cmd != nil && c.cmd.Process != nil {
-		go reapAfterGrace(c.cmd.Process)
+		go c.reapProcessTree()
 	}
 	return err
 }
 
-// reapAfterGrace kills the process if it is still alive after the grace
-// period. Kill on an already-exited process returns an error that is
-// intentionally ignored.
-func reapAfterGrace(p *os.Process) {
-	time.Sleep(closeKillGrace)
-	_ = p.Kill()
+// reapProcessTree lets the daemon observe stdin EOF first, then terminates its
+// entire process group. The escalation is asynchronous so Close remains
+// non-blocking while still reclaiming descendants that ignore EOF or SIGTERM.
+func (c *Client) reapProcessTree() {
+	if c.cmd == nil || c.cmd.Process == nil {
+		return
+	}
+	if c.processDone != nil {
+		select {
+		case <-c.processDone:
+		case <-time.After(closeKillGrace):
+		}
+	} else {
+		time.Sleep(closeKillGrace)
+	}
+
+	_ = terminateProcessGroup(c.cmd.Process)
+	timer := time.NewTimer(closeKillEscalationGrace)
+	defer timer.Stop()
+	<-timer.C
+	_ = killProcessGroup(c.cmd.Process)
 }
 
 // isClosed reports whether the client is closed.
