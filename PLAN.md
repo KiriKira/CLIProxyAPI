@@ -64,7 +64,12 @@ Reviewed branch head: `ee3b2605a9e93bb4f3a162751ec582cbcbf80cc5`.
   `antigravity_acp_r1_test.go` (pool level: single-worker fresh progress,
   hook purge, never-in-use, evicted-bound purge; executor level: both
   binding tables emptied and lookups fail after forced retirement).
-- R2-R8: not started; order below is unchanged.
+- **R4 — FIXED.** Binding validation moved fully inside
+  `acquireDocumentSession` / `acquireStatefulSession` (see Step 2 below);
+  the prompt builder starts only after the hit/miss verdict is final, so no
+  incremental payload can leak into a fresh session and the captured
+  `promptPayload` is never mutated after the goroutine starts.
+- R2/R3/R5-R8: not started; order below is unchanged.
 
 The branch contains the right overall direction:
 
@@ -843,7 +848,19 @@ Add forced retirement of an **idle draining** worker when fresh-session demand o
 
 Remove the incremental/full-payload race and add deterministic stream/non-stream tests.
 
-**Exit criterion:** every bootstrap sends the full recovery payload; every incremental payload belongs to a verified hit.
+**Status: implemented, tests green.**
+
+All binding validation now completes INSIDE `acquireDocumentSession` /
+`acquireStatefulSession` (the PLAN's preferred option 1): both helpers
+return a fully resolved acquire result whose `hit` verdict is final, and
+the caller selects the incremental vs. full payload BEFORE starting the
+prompt builder goroutine. The old post-build `Lookup`-and-switch blocks
+(the data race and the incremental-payload leak into fresh sessions) are
+removed from both `Execute` and `ExecuteStream`. A hit lease is never
+re-decided after the builder starts; every miss bootstraps from the full
+request via the normal `openSession` path.
+
+**Exit criterion:** every bootstrap sends the full recovery payload; every incremental payload belongs to a verified hit. *(Met by `TestR4_DocumentLateInvalidationBootstrapsFullHistory`, `TestR4_StreamAndNonStreamAgreeOnLateInvalidation`, and `TestR4_StrictLateInvalidationBootstrapsFullHistory`.)*
 
 ## Step 3 — Replace document raw mutex lanes (R2)
 

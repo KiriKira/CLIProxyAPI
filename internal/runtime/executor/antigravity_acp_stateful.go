@@ -115,7 +115,20 @@ func statefulIncrementalTurn(payload []byte) ([]byte, error) {
 // worker gone) returns hit=false with a nil worker and the caller
 // bootstraps statelessly from the full history the client re-sent —
 // recovery stays transparent (P1.2).
-func (e *AntigravityAcpExecutor) acquireStatefulSession(ctx context.Context, auth *cliproxyauth.Auth, signals statefulTurnSignals, model string, payload []byte, stages *acpTTFTStage) (worker *helps.AntigravityAcpWorker, sessionID string, variant string, hit bool, err error) {
+// statefulAcquire carries the fully resolved acquisition state for one
+// strict-stateful request. R4: the turn-order gate and the authoritative
+// post-lease validation both complete INSIDE acquireStatefulSession, so a
+// returned hit is final and the incremental payload decision belongs to the
+// caller BEFORE any prompt build starts.
+type statefulAcquire struct {
+	worker    *helps.AntigravityAcpWorker
+	sessionID string
+	variant   string
+	hit       bool
+}
+
+func (e *AntigravityAcpExecutor) acquireStatefulSession(ctx context.Context, auth *cliproxyauth.Auth, signals statefulTurnSignals, model string, payload []byte, stages *acpTTFTStage) (statefulAcquire, error) {
+	out := statefulAcquire{}
 	key := e.authPoolKey(auth)
 	tableKey := logicalLookupKey(signals.logicalID, key)
 	resolvedVariant := resolveAntigravityModel(model, payload)
@@ -124,17 +137,17 @@ func (e *AntigravityAcpExecutor) acquireStatefulSession(ctx context.Context, aut
 	// incoming_turn == binding.LastTurn + 1.
 	binding, present := e.stateful.Lookup(tableKey, nil, key, resolvedVariant)
 	if !present {
-		return nil, "", "", false, nil
+		return out, nil
 	}
 	if signals.turn != binding.LastTurn+1 {
 		// Duplicated, skipped, stale or malformed turn: invalidate and
 		// bootstrap from the full request history.
 		e.stateful.Invalidate(tableKey)
-		return nil, "", "", false, nil
+		return out, nil
 	}
 	target := e.stateful.WorkerOf(tableKey)
 	if target == nil {
-		return nil, "", "", false, nil
+		return out, nil
 	}
 	// Reacquire the SAME worker: the ACP session id is process-local. When
 	// the worker is busy serving another prompt, this turn waits for it
@@ -143,16 +156,22 @@ func (e *AntigravityAcpExecutor) acquireStatefulSession(ctx context.Context, aut
 	if acqErr != nil {
 		// Worker died or left the pool: drop the binding, bootstrap.
 		e.stateful.Invalidate(tableKey)
-		return nil, "", "", false, nil
+		return out, nil
 	}
-	// Authoritative worker-matched validation after the lease.
+	// Authoritative worker-matched validation after the lease: this is the
+	// FINAL binding check. A hit returned here is verified live; the caller
+	// must not re-decide the payload after its prompt builder started (R4).
 	binding, present = e.stateful.Lookup(tableKey, w, key, resolvedVariant)
 	if !present {
 		e.pool.Release(w, true)
-		return nil, "", "", false, nil
+		return out, nil
 	}
 	stages.markPoolAcquired()
-	return w, binding.ACPSessionID, resolvedVariant, true, nil
+	out.hit = true
+	out.worker = w
+	out.sessionID = binding.ACPSessionID
+	out.variant = resolvedVariant
+	return out, nil
 }
 
 // logicalLookupKey scopes the logical session id by auth pool key so two

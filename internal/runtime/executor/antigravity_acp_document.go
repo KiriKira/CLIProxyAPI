@@ -206,37 +206,62 @@ func documentSemanticProjection(value any) any {
 	}
 }
 
-func (e *AntigravityAcpExecutor) acquireDocumentSession(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stages *acpTTFTStage) (documentRequestInfo, func(), string, *helps.AntigravityAcpWorker, *acp.Client, string, bool, error) {
+// documentAcquire carries the fully resolved acquisition state for one
+// document request: the prepared request info plus, on a verified hit, the
+// live binding components. R4: binding validation completes INSIDE
+// acquireDocumentSession, so the hit decision (and its incremental payload)
+// is final before the caller starts any prompt build.
+type documentAcquire struct {
+	info        documentRequestInfo
+	authKey     string
+	variant     string
+	sessionID   string // bound ACP session; valid only when hit
+	worker      *helps.AntigravityAcpWorker
+	client      *acp.Client
+	hit         bool
+	releaseLane func()
+}
+
+func (e *AntigravityAcpExecutor) acquireDocumentSession(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stages *acpTTFTStage) (documentAcquire, error) {
+	noRelease := func() {}
 	signals := documentSignalsFromOptions(opts)
 	if !signals.enabled {
-		return documentRequestInfo{}, func() {}, "", nil, nil, "", false, nil
+		return documentAcquire{releaseLane: noRelease}, nil
 	}
 	authKey := e.authPoolKey(auth)
 	variant := resolveAntigravityModel(req.Model, req.Payload)
 	info, err := prepareDocumentRequest(req.Payload, authKey, variant, signals, string(opts.SourceFormat))
 	if err != nil {
-		return documentRequestInfo{}, func() {}, authKey, nil, nil, variant, false, err
+		return documentAcquire{authKey: authKey, variant: variant, releaseLane: noRelease}, err
 	}
 	if e.pool == nil || e.document == nil {
-		return info, func() {}, authKey, nil, nil, variant, false, nil
+		return documentAcquire{info: info, authKey: authKey, variant: variant, releaseLane: noRelease}, nil
 	}
 	releaseLane := e.document.LockLane(info.key)
+	acq := documentAcquire{info: info, authKey: authKey, variant: variant, releaseLane: releaseLane}
 	binding, ok := e.document.Lookup(info.key, nil, authKey, variant)
 	if !ok {
-		return info, releaseLane, authKey, nil, nil, variant, false, nil
+		return acq, nil
 	}
 	worker, err := e.pool.AcquireSpecific(ctx, binding.Worker)
 	if err != nil {
 		e.document.Invalidate(info.key)
-		return info, releaseLane, authKey, nil, nil, variant, false, nil
+		return acq, nil
 	}
+	// Authoritative post-lease validation: this is the FINAL binding check.
+	// A hit returned here is verified live; the caller must not re-decide
+	// the payload after its prompt builder started (R4).
 	binding, ok = e.document.Lookup(info.key, worker, authKey, variant)
 	if !ok {
 		e.pool.Release(worker, true)
-		return info, releaseLane, authKey, nil, nil, variant, false, nil
+		return acq, nil
 	}
 	now := time.Now()
 	stages.markPoolAcquired()
 	stages.markSessionSetup(now, now, "document_reuse")
-	return info, releaseLane, authKey, worker, worker.Client(), variant, true, nil
+	acq.hit = true
+	acq.sessionID = binding.ACPSessionID
+	acq.worker = worker
+	acq.client = worker.Client()
+	return acq, nil
 }

@@ -1432,51 +1432,51 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 
 	var client *acp.Client
 	var worker *helps.AntigravityAcpWorker
+	var sessionID string
 	var authKey string
 	var resolvedVariant string
 	var documentKey string
-	var documentInfo documentRequestInfo
-	// statefulHit is shared by the execution core for both strict stateful
-	// hits and document-affinity hits; documentHit selects the binding table.
 	statefulHit := false
 	documentHit := false
 	promptPayload := req.Payload
 
 	if documentMode {
-		info, releaseLane, key, documentWorker, documentClient, variant, hit, documentErr := e.acquireDocumentSession(ctx, auth, req, opts, stages)
+		acq, documentErr := e.acquireDocumentSession(ctx, auth, req, opts, stages)
 		if documentErr != nil {
 			return resp, documentErr
 		}
-		documentInfo = info
-		defer releaseLane()
-		authKey = key
-		resolvedVariant = variant
-		promptPayload = info.cleanedPayload
-		documentKey = info.key
-		if hit {
-			worker = documentWorker
-			client = documentClient
+		defer acq.releaseLane()
+		// R4: the hit decision is final here — the incremental payload is
+		// selected BEFORE the prompt builder below is ever started.
+		authKey = acq.authKey
+		resolvedVariant = acq.variant
+		documentKey = acq.info.key
+		promptPayload = acq.info.cleanedPayload
+		if acq.hit {
+			worker = acq.worker
+			client = acq.client
+			sessionID = acq.sessionID
 			statefulHit = true
 			documentHit = true
-			promptPayload = info.incrementalBody
+			promptPayload = acq.info.incrementalBody
 		}
 	}
 
 	if !documentMode && e.pool != nil {
 		authKey = e.authPoolKey(auth)
 		if signals.reuse && e.stateful != nil {
-			w, _, variant, hit, acqErr := e.acquireStatefulSession(ctx, auth, signals, req.Model, req.Payload, stages)
+			acq, acqErr := e.acquireStatefulSession(ctx, auth, signals, req.Model, req.Payload, stages)
 			if acqErr != nil {
 				return resp, acqErr
 			}
-			if hit {
+			if acq.hit {
 				turnPayload, turnErr := statefulIncrementalTurn(req.Payload)
 				if turnErr == nil {
-					worker = w
-					client = w.Client()
+					worker = acq.worker
+					client = acq.worker.Client()
 					statefulHit = true
 					promptPayload = turnPayload
-					resolvedVariant = variant
+					resolvedVariant = acq.variant
 					// A hit performs no session/new and no model config:
 					// stamp both session stages at pool acquisition (P0.2
 					// semantics; session_mode distinguishes the path).
@@ -1484,7 +1484,7 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 					stages.markSessionSetup(now, now, "stateful_reuse")
 				} else {
 					// Ambiguous history: release the lease, bootstrap.
-					e.pool.Release(w, true)
+					e.pool.Release(acq.worker, true)
 				}
 			}
 		}
@@ -1542,31 +1542,13 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 		promptCh <- promptResult{blocks, cleanupAttachments, buildErr}
 	}()
 
-	sessionID := ""
-	if statefulHit {
-		if documentHit {
-			binding, ok := e.document.Lookup(documentKey, worker, authKey, resolvedVariant)
-			if !ok {
-				statefulHit = false
-				documentHit = false
-				promptPayload = documentInfo.cleanedPayload
-			} else {
-				sessionID = binding.ACPSessionID
-			}
-		} else {
-			// Continue the bound strict ACP session directly.
-			binding, ok := e.stateful.Lookup(logicalLookupKey(signals.logicalID, authKey), worker, authKey, resolvedVariant)
-			if !ok {
-				// Raced invalidation between acquire and here: redo statelessly.
-				statefulHit = false
-			} else {
-				sessionID = binding.ACPSessionID
-				if resolvedVariant == "" {
-					resolvedVariant = resolveAntigravityModel(req.Model, req.Payload)
-				}
-			}
-		}
-	}
+	// R4: binding validation completed inside acquireDocumentSession /
+	// acquireStatefulSession BEFORE this prompt build started. A hit is
+	// final here: statefulHit means promptPayload already holds the
+	// incremental newest-user batch bound to a live verified session, and
+	// !statefulHit means promptPayload holds the full bootstrap request for
+	// the openSession below. The old post-start Lookup-and-switch here was
+	// both a data race and an incremental-payload leak into fresh sessions.
 	if !statefulHit {
 		var err error
 		sessionID, _, resolvedVariant, err = openSession(ctx, client, worker, req.Model, req.Payload, stages)
@@ -1739,55 +1721,56 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 
 	var client *acp.Client
 	var worker *helps.AntigravityAcpWorker
+	var sessionID string
 	var authKey string
 	var resolvedVariant string
 	var documentKey string
-	var documentInfo documentRequestInfo
 	var releaseDocumentLane = func() {}
-	var documentLaneOnce sync.Once
 	statefulHit := false
 	documentHit := false
 	promptPayload := req.Payload
 
 	if documentMode {
-		info, releaseLane, key, documentWorker, documentClient, variant, hit, documentErr := e.acquireDocumentSession(ctx, auth, req, opts, stages)
+		acq, documentErr := e.acquireDocumentSession(ctx, auth, req, opts, stages)
 		if documentErr != nil {
 			return nil, documentErr
 		}
-		documentInfo = info
-		releaseDocumentLane = func() { documentLaneOnce.Do(releaseLane) }
-		authKey = key
-		resolvedVariant = variant
-		promptPayload = info.cleanedPayload
-		documentKey = info.key
-		if hit {
-			worker = documentWorker
-			client = documentClient
+		releaseDocumentLane = acq.releaseLane
+		// R4: the hit decision is final here — the incremental payload is
+		// selected BEFORE the prompt builder below is ever started.
+		authKey = acq.authKey
+		resolvedVariant = acq.variant
+		documentKey = acq.info.key
+		promptPayload = acq.info.cleanedPayload
+		if acq.hit {
+			worker = acq.worker
+			client = acq.client
+			sessionID = acq.sessionID
 			statefulHit = true
 			documentHit = true
-			promptPayload = info.incrementalBody
+			promptPayload = acq.info.incrementalBody
 		}
 	}
 
 	if !documentMode && e.pool != nil {
 		authKey = e.authPoolKey(auth)
 		if signals.reuse && e.stateful != nil {
-			w, _, variant, hit, acqErr := e.acquireStatefulSession(ctx, auth, signals, req.Model, req.Payload, stages)
+			acq, acqErr := e.acquireStatefulSession(ctx, auth, signals, req.Model, req.Payload, stages)
 			if acqErr != nil {
 				return nil, acqErr
 			}
-			if hit {
+			if acq.hit {
 				turnPayload, turnErr := statefulIncrementalTurn(req.Payload)
 				if turnErr == nil {
-					worker = w
-					client = w.Client()
+					worker = acq.worker
+					client = acq.worker.Client()
 					statefulHit = true
 					promptPayload = turnPayload
-					resolvedVariant = variant
+					resolvedVariant = acq.variant
 					now := time.Now()
 					stages.markSessionSetup(now, now, "stateful_reuse")
 				} else {
-					e.pool.Release(w, true)
+					e.pool.Release(acq.worker, true)
 				}
 			}
 		}
@@ -1833,29 +1816,10 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 		promptCh <- promptResult{blocks, cleanupAttachments, buildErr}
 	}()
 
-	sessionID := ""
-	if statefulHit {
-		if documentHit {
-			binding, ok := e.document.Lookup(documentKey, worker, authKey, resolvedVariant)
-			if !ok {
-				statefulHit = false
-				documentHit = false
-				promptPayload = documentInfo.cleanedPayload
-			} else {
-				sessionID = binding.ACPSessionID
-			}
-		} else {
-			binding, ok := e.stateful.Lookup(logicalLookupKey(signals.logicalID, authKey), worker, authKey, resolvedVariant)
-			if !ok {
-				statefulHit = false
-			} else {
-				sessionID = binding.ACPSessionID
-				if resolvedVariant == "" {
-					resolvedVariant = resolveAntigravityModel(req.Model, req.Payload)
-				}
-			}
-		}
-	}
+	// R4: binding validation completed inside acquireDocumentSession /
+	// acquireStatefulSession BEFORE this prompt build started. A hit is
+	// final here (see the Execute-path comment); no post-start
+	// Lookup-and-switch exists on the stream path either.
 	if !statefulHit {
 		var err error
 		sessionID, _, resolvedVariant, err = openSession(ctx, client, worker, req.Model, req.Payload, stages)

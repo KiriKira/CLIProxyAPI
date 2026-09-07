@@ -180,6 +180,36 @@ func (t *DocumentSessionTable) PurgeWorker(worker *AntigravityAcpWorker) {
 	}
 }
 
+// PurgeAll drops every binding in the table. Test/diagnostics aid that
+// mirrors what PurgeWorker does for one worker, without worker filtering
+// (e.g. R4 tests simulating a late table-wide invalidation).
+func (t *DocumentSessionTable) PurgeAll() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for el := t.lru.Front(); el != nil; el = t.lru.Front() {
+		t.removeLocked(el)
+	}
+}
+
+// PurgeAllForTest drops every binding; test-only naming keeps intent clear.
+func (t *DocumentSessionTable) InvalidateAllForTest() { t.PurgeAll() }
+
+// InvalidateAllForTest drops every strict-stateful binding; test-only
+// helper for R4-style late invalidation.
+func (t *StatefulSessionTable) InvalidateAllForTest() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for el := t.lru.Front(); el != nil; el = t.lru.Front() {
+		t.removeLocked(el)
+	}
+}
+
 func (t *DocumentSessionTable) Len() int {
 	if t == nil {
 		return 0
