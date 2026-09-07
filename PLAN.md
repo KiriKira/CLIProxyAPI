@@ -69,7 +69,12 @@ Reviewed branch head: `ee3b2605a9e93bb4f3a162751ec582cbcbf80cc5`.
   the prompt builder starts only after the hit/miss verdict is final, so no
   incremental payload can leak into a fresh session and the captured
   `promptPayload` is never mutated after the goroutine starts.
-- R2/R3/R5-R8: not started; order below is unchanged.
+- **R2 — FIXED.** Raw per-key mutex lanes replaced with context-aware,
+  reference-counted, bounded token-channel lanes (`AcquireLane`): ctx
+  cancellation while waiting, bounded waiter queue with retryable
+  `ErrDocumentLaneBusy`, lane GC on last reference, ABA-safe releases (see
+  Step 3 below).
+- R3/R5-R8: not started; order below is unchanged.
 
 The branch contains the right overall direction:
 
@@ -866,7 +871,20 @@ request via the normal `openSession` path.
 
 Implement context-aware bounded keyed lanes with automatic lifecycle cleanup.
 
-**Exit criterion:** cancellation/backpressure/lane-GC tests pass and cold burst still creates one session.
+**Status: implemented, tests green.**
+
+`DocumentSessionTable.lanes` is now `map[string]*documentLane`: a
+capacity-1 token channel (empty = free, full = held) with reference-counted
+lifecycle. `AcquireLane(key, ctx, maxWaiters)` provides one-lane bootstrap
+singleflight, `ctx.Done()` cancellation while waiting, a bounded waiter
+queue (`DefaultDocumentLaneMaxWaiters`, overflow returns retryable
+`ErrDocumentLaneBusy`), automatic lane removal when the last reference
+drops (no growth proportional to historical pages), and pointer-identity
+staleness checks (ABA-safe releases from removed-and-recreated lanes). The
+executor's document acquisition uses `AcquireLane`; the raw-mutex
+`LockLane` remains only as a deprecated test helper.
+
+**Exit criterion:** cancellation/backpressure/lane-GC tests pass and cold burst still creates one session. *(Met by `TestDocumentLane_GCManyHistoricalKeys`, `TestDocumentLane_CanceledWaiterExitsPromptly`, `TestDocumentLane_QueueLimitEnforced`, `TestDocumentLane_ColdBurstSingleflights` under `-race`, plus the existing document-reuse integration tests.)*
 
 ## Step 4 — Fix title identity correctness (R3 + R6)
 

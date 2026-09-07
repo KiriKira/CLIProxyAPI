@@ -237,7 +237,13 @@ func (e *AntigravityAcpExecutor) acquireDocumentSession(ctx context.Context, aut
 	if e.pool == nil || e.document == nil {
 		return documentAcquire{info: info, authKey: authKey, variant: variant, releaseLane: noRelease}, nil
 	}
-	releaseLane := e.document.LockLane(info.key)
+	releaseLane, laneErr := e.document.AcquireLane(info.key, ctx, 0)
+	if laneErr != nil {
+		// R2 backpressure: the per-document queue is full (or the client
+		// went away). Return a retryable error instead of creating another
+		// ACP session behind an unbounded wait queue.
+		return documentAcquire{info: info, authKey: authKey, variant: variant, releaseLane: func() {}}, laneErr
+	}
 	acq := documentAcquire{info: info, authKey: authKey, variant: variant, releaseLane: releaseLane}
 	binding, ok := e.document.Lookup(info.key, nil, authKey, variant)
 	if !ok {
