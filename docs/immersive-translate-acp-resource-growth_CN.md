@@ -17,6 +17,7 @@
 - **没有** URL、视频 ID（无 `watch?v=`/`youtu.be`）、时间戳或段序列号——无法从请求体直接定位视频内进度。
 - **Title 的不稳定前缀**：`(132) ` 是 YouTube 标签页的计数前缀（通知数），观看过程中可能变化。作分组键时应剥离 `^\(\d+\)\s` 前缀和 ` - YouTube` 后缀，取中间的纯视频标题。
 - 其余可分层区分：来源 IP（所有插件请求同出口）、User-Agent（代理日志未记录，Caddy 未开 access log）、请求体内容哈希。
+- **Header 层实测（Caddy access log，2026-09-07 部署后）**：无任何视频级标记。插件真实请求头恒定：`Origin: chrome-extension://amkbmndfnliijdhojkpoglbnaaahippg`、浏览器 UA（Edge/Chrome Windows）、无 Referer、无自定义 X-* 业务头；同时带 `Api-Key` + `Authorization` 双凭据头。**同视频分组只能依赖请求体 Document Metadata Title。**
 - 佐证存储形态：daemon conversations/ 每 session 一对 `<uuid>.db+.meta`；`meta` 仅 `{"cwd": ...}`；翻译 prompt 存于 `steps.step_payload`（UTF-8 原文，可用 `CAST(step_payload AS TEXT)` 提取，`strings` 会被多字节切断）。
 
 ## localharness / session 增长方式（核心发现）
