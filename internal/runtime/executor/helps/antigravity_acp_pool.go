@@ -81,9 +81,8 @@ func (w *AntigravityAcpWorker) MarkDead(err error) {
 }
 
 type workerRetirement struct {
-	worker       *AntigravityAcpWorker
-	reason       string
-	waitForClose bool
+	worker *AntigravityAcpWorker
+	reason string
 }
 
 // AntigravityAcpPool manages persistent ACP daemon workers.
@@ -127,11 +126,14 @@ type AntigravityAcpPool struct {
 
 	// onWorkerRetired is invoked exactly once when a worker is removed from
 	// the pool, so the owner can purge strict/document bindings that pointed
-	// at it. Ordinary retirement paths invoke the hook outside p.mu before
-	// returning capacity; the binding-table-driven tryRecycle path defers the
-	// same finalizer to avoid re-entering a table lock. Set once via
-	// SetWorkerRetiredHook before the pool serves traffic.
+	// at it. Ordinary retirement paths invoke the hook and wait for process-tree
+	// cleanup outside p.mu before returning capacity; the binding-table-driven
+	// tryRecycle path defers the same finalizer to avoid re-entering a table lock.
+	// Set once via SetWorkerRetiredHook before the pool serves traffic.
 	onWorkerRetired func(*AntigravityAcpWorker)
+	// closeWorkerAndWait is injectable for deterministic lifecycle tests. The
+	// production default is acp.Client.CloseAndWait.
+	closeWorkerAndWait func(context.Context, *acp.Client) error
 
 	// Factory launches a new ACP client for the given key/identity.
 	Factory func(ctx context.Context, key string) (*acp.Client, error)
@@ -437,9 +439,9 @@ func (p *AntigravityAcpPool) retireWorkerLocked(w *AntigravityAcpWorker, reason 
 }
 
 // finishWorkerRetirement completes a retirement started by
-// retireWorkerLocked. It must be called without p.mu held. The logical global
-// slot is returned only after binding purge and client shutdown has started;
-// physical process-tree waiting remains the R1b follow-up in PLAN.md.
+// retireWorkerLocked. It must be called without p.mu held. The binding hook and
+// owned process-tree cleanup complete before the logical global slot is
+// returned and waiters are woken.
 func (p *AntigravityAcpPool) finishWorkerRetirement(retirement *workerRetirement) {
 	if p == nil || retirement == nil || retirement.worker == nil {
 		return
@@ -451,12 +453,19 @@ func (p *AntigravityAcpPool) finishWorkerRetirement(retirement *workerRetirement
 		"worker_state":          "retired",
 		"worker_recycle_reason": retirement.reason,
 	}).Info("ACP worker retired")
-	if retirement.waitForClose {
-		if worker.client != nil {
-			_ = worker.client.Close()
+	if worker.client != nil {
+		closeWorker := p.closeWorkerAndWait
+		if closeWorker == nil {
+			closeWorker = func(ctx context.Context, client *acp.Client) error {
+				return client.CloseAndWait(ctx)
+			}
 		}
-	} else {
-		closeClientAsync(worker.client)
+		if err := closeWorker(context.Background(), worker.client); err != nil {
+			log.WithError(err).WithFields(map[string]interface{}{
+				"provider":              "antigravity-acp",
+				"worker_recycle_reason": retirement.reason,
+			}).Warn("ACP worker process-tree cleanup did not complete cleanly")
+		}
 	}
 
 	p.mu.Lock()
@@ -992,7 +1001,6 @@ func (p *AntigravityAcpPool) Close() error {
 		w.dropPreparedSessionsLocked()
 		w.mu.Unlock()
 		if retirement, ok := p.retireWorkerLocked(w, "pool_close"); ok {
-			retirement.waitForClose = true
 			retirements = append(retirements, retirement)
 		}
 	}

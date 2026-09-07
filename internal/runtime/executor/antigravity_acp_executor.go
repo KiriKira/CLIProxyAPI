@@ -44,6 +44,9 @@ type AntigravityAcpExecutor struct {
 	// from strict turn-based stateful reuse because document clients send no
 	// monotonic turn or full history.
 	document *helps.DocumentSessionTable
+	// documentLaneMaxWaiters is zero in production to use the bounded table
+	// default; tests may lower it to exercise HTTP backpressure deterministically.
+	documentLaneMaxWaiters int
 }
 
 func (e *AntigravityAcpExecutor) authPoolKey(auth *cliproxyauth.Auth) string {

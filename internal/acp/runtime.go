@@ -103,6 +103,9 @@ type Client struct {
 	// processDone closes when cmd.Wait returns. It is separate from exitCh so
 	// the background process-group reaper does not consume the public result.
 	processDone chan struct{}
+	// processTreeDone closes after Close has completed process-group cleanup.
+	// It is nil for pipe-constructed test clients without an owned process.
+	processTreeDone chan struct{}
 
 	logStderr clientLogFunc
 }
@@ -176,6 +179,7 @@ func NewClient(cfg SpawnConfig) (*Client, error) {
 	c := newClientWithPipes(stdinPipe, stdoutPipe, stderrPipe, cfg.LogStderr, cfg.OnUpdate)
 	c.cmd = cmd
 	c.processDone = make(chan struct{})
+	c.processTreeDone = make(chan struct{})
 	go func() {
 		err := cmd.Wait()
 		c.exitCh <- err
@@ -267,10 +271,39 @@ func (c *Client) Close() error {
 	return err
 }
 
+// CloseAndWait closes the client and waits until its owned process group has
+// completed cleanup. It is the strict lifecycle counterpart to Close: callers
+// that are about to return a hard process-capacity token must use this method.
+// Pipe-constructed clients without an owned process return after Close.
+func (c *Client) CloseAndWait(ctx context.Context) error {
+	if c == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	closeErr := c.Close()
+	if c.processTreeDone == nil {
+		return closeErr
+	}
+	select {
+	case <-c.processTreeDone:
+		return closeErr
+	case <-ctx.Done():
+		if closeErr != nil {
+			return errors.Join(closeErr, ctx.Err())
+		}
+		return ctx.Err()
+	}
+}
+
 // reapProcessTree lets the daemon observe stdin EOF first, then terminates its
 // entire process group. The escalation is asynchronous so Close remains
 // non-blocking while still reclaiming descendants that ignore EOF or SIGTERM.
 func (c *Client) reapProcessTree() {
+	if c.processTreeDone != nil {
+		defer close(c.processTreeDone)
+	}
 	if c.cmd == nil || c.cmd.Process == nil {
 		return
 	}

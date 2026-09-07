@@ -166,6 +166,14 @@ func (e *AntigravityAcpExecutor) acquireStatefulSession(ctx context.Context, aut
 		e.pool.Release(w, true)
 		return out, nil
 	}
+	if signals.turn != binding.LastTurn+1 {
+		// A concurrent request may have completed the same turn while this
+		// request waited for the owning worker. Do not append an incremental
+		// duplicate; invalidate and let the caller bootstrap from full history.
+		e.stateful.Invalidate(tableKey)
+		e.pool.Release(w, true)
+		return out, nil
+	}
 	stages.markPoolAcquired()
 	out.hit = true
 	out.worker = w

@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/acp"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -180,7 +181,73 @@ func TestStatefulReuse_TwoTurnHitSendsOnlyNewTurn(t *testing.T) {
 	}
 }
 
-// TestStatefulReuse_TurnMismatchFallsBackToBootstrap covers P1.6 #5: a
+// TestStatefulReuse_PostLeaseTurnRecheckRejectsConcurrentDuplicate verifies
+// the R4a race: a request may pass the pre-lease turn check, wait behind an
+// earlier lease, and observe that the binding already advanced. It must fall
+// back instead of appending the same incremental turn twice.
+func TestStatefulReuse_PostLeaseTurnRecheckRejectsConcurrentDuplicate(t *testing.T) {
+	execer := NewAntigravityAcpExecutor(&internalconfig.Config{Antigravity: internalconfig.AntigravityConfig{PersistentProcess: boolPtr(true)}})
+	t.Cleanup(func() { _ = execer.pool.Close() })
+	auth := &cliproxyauth.Auth{ID: "r4-post-lease", Attributes: map[string]string{}}
+	key := execer.authPoolKey(auth)
+	worker, err := execer.pool.Acquire(context.Background(), key, func(ctx context.Context) (*acp.Client, error) {
+		return &acp.Client{}, nil
+	})
+	if err != nil {
+		t.Fatalf("initial worker acquire: %v", err)
+	}
+	worker.RegisterSessionCreated("strict-session", "fresh")
+	logicalID := "r4-post-lease-session"
+	variant := resolveAntigravityModel("gemini-3.8-flash", nil)
+	execer.stateful.Bind(logicalLookupKey(logicalID, key), "strict-session", key, variant, worker, 0)
+	execer.pool.Release(worker, true)
+
+	// Keep the owning worker busy so the candidate turn passes its initial
+	// lookup and waits in AcquireSpecific.
+	blocker, err := execer.pool.Acquire(context.Background(), key, nil)
+	if err != nil {
+		t.Fatalf("blocking worker acquire: %v", err)
+	}
+	resultCh := make(chan statefulAcquire, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		result, acquireErr := execer.acquireStatefulSession(
+			context.Background(),
+			auth,
+			statefulTurnSignals{logicalID: logicalID, reuse: true, turn: 1, turnValid: true},
+			"gemini-3.8-flash",
+			[]byte(`{"messages":[{"role":"user","content":"duplicate"}]}`),
+			&acpTTFTStage{},
+		)
+		if acquireErr != nil {
+			errCh <- acquireErr
+			return
+		}
+		resultCh <- result
+	}()
+
+	select {
+	case errAcquire := <-errCh:
+		t.Fatalf("post-lease acquire failed before duplicate update: %v", errAcquire)
+	case <-time.After(100 * time.Millisecond):
+	}
+	// Simulate the earlier request completing turn 1 while the candidate is
+	// waiting for the same worker.
+	execer.stateful.Bind(logicalLookupKey(logicalID, key), "strict-session", key, variant, worker, 1)
+	execer.pool.Release(blocker, true)
+
+	select {
+	case result := <-resultCh:
+		if result.hit || result.worker != nil || result.sessionID != "" {
+			t.Fatalf("duplicate turn was accepted after lease: %+v", result)
+		}
+	case errAcquire := <-errCh:
+		t.Fatalf("post-lease duplicate acquire failed: %v", errAcquire)
+	case <-time.After(2 * time.Second):
+		t.Fatal("post-lease duplicate acquire did not finish")
+	}
+}
+
 // duplicated/skipped turn invalidates the binding and bootstraps from the
 // full history.
 func TestStatefulReuse_TurnMismatchFallsBackToBootstrap(t *testing.T) {

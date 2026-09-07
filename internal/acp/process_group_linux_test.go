@@ -4,6 +4,7 @@ package acp
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -109,8 +110,8 @@ func TestClientCloseForceKillsProcessGroup(t *testing.T) {
 		t.Fatalf("ACP parent exited before Close: %v", exitErr)
 	default:
 	}
-	if err := client.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
+	if err := client.CloseAndWait(context.Background()); err != nil {
+		t.Fatalf("CloseAndWait: %v", err)
 	}
 	select {
 	case <-client.ExitErr():

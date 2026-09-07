@@ -5,7 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"regexp"
 	"strings"
 	"time"
@@ -17,8 +19,10 @@ import (
 )
 
 const (
-	documentTitlePromptStart = "[[CLIPROXY_ACP_TITLE_PROMPT:v1]]"
-	documentTitlePromptEnd   = "[[/CLIPROXY_ACP_TITLE_PROMPT]]"
+	documentTitlePromptStart   = "[[CLIPROXY_ACP_TITLE_PROMPT:v1]]"
+	documentTitlePromptEnd     = "[[/CLIPROXY_ACP_TITLE_PROMPT]]"
+	documentDocumentTitleStart = "[[CLIPROXY_ACP_DOCUMENT_TITLE:v1]]"
+	documentDocumentTitleEnd   = "[[/CLIPROXY_ACP_DOCUMENT_TITLE]]"
 )
 
 // youtubeTitleDecoration strips a leading YouTube notification counter
@@ -73,7 +77,6 @@ func prepareDocumentRequest(payload []byte, authKey, modelVariant string, signal
 	}
 
 	var title string
-	var marked bool
 	var rewrite func(any) any
 	rewrite = func(value any) any {
 		switch typed := value.(type) {
@@ -86,23 +89,17 @@ func prepareDocumentRequest(payload []byte, authKey, modelVariant string, signal
 				typed[i] = rewrite(child)
 			}
 		case string:
-			if strings.Contains(typed, documentTitlePromptStart) && strings.Contains(typed, documentTitlePromptEnd) {
-				start := strings.Index(typed, documentTitlePromptStart) + len(documentTitlePromptStart)
-				end := strings.Index(typed[start:], documentTitlePromptEnd)
-				if end >= 0 {
-					if title == "" {
-						title = parseDocumentTitle(typed[start : start+end])
-					}
-					marked = true
-				}
+			if markerTitle, markerFound := documentMarkerTitle(typed); markerFound && title == "" {
+				title = markerTitle
 			}
-			if !marked && title == "" {
+			if title == "" {
 				title = parseDocumentTitle(typed)
 			}
-			return strings.ReplaceAll(strings.ReplaceAll(typed, documentTitlePromptStart, ""), documentTitlePromptEnd, "")
+			return stripDocumentMarkers(typed)
 		}
 		return value
 	}
+	semantic := documentSemanticFingerprint(root)
 	cleanedRoot := rewrite(root)
 	cleanedPayload, err := json.Marshal(cleanedRoot)
 	if err != nil {
@@ -111,7 +108,6 @@ func prepareDocumentRequest(payload []byte, authKey, modelVariant string, signal
 	if signals.documentID == "" && strings.TrimSpace(title) == "" {
 		return documentRequestInfo{}, fmt.Errorf("document mode requires a page title or X-ACP-Document-ID")
 	}
-	semantic := documentSemanticFingerprint(cleanedRoot)
 	incremental, err := newestDocumentUserBatch(cleanedRoot)
 	if err != nil {
 		return documentRequestInfo{}, err
@@ -142,6 +138,88 @@ func parseDocumentTitle(text string) string {
 		return strings.TrimSpace(value)
 	}
 	return ""
+}
+
+func documentMarkerTitle(text string) (string, bool) {
+	markers := [][2]string{
+		{documentTitlePromptStart, documentTitlePromptEnd},
+		{documentDocumentTitleStart, documentDocumentTitleEnd},
+	}
+	var title string
+	found := false
+	for _, marker := range markers {
+		start := strings.Index(text, marker[0])
+		if start < 0 {
+			continue
+		}
+		contentStart := start + len(marker[0])
+		end := strings.Index(text[contentStart:], marker[1])
+		if end < 0 {
+			continue
+		}
+		found = true
+		candidate := strings.TrimSpace(text[contentStart : contentStart+end])
+		if marker[0] == documentTitlePromptStart {
+			candidate = parseDocumentTitle(candidate)
+		}
+		if candidate == "{{imt_title}}" || candidate == "" {
+			continue
+		}
+		if title == "" {
+			title = strings.Trim(candidate, "\"“”")
+		}
+	}
+	return strings.TrimSpace(title), found
+}
+
+func stripDocumentMarkers(text string) string {
+	for _, marker := range [][2]string{
+		{documentTitlePromptStart, documentTitlePromptEnd},
+		{documentDocumentTitleStart, documentDocumentTitleEnd},
+	} {
+		text = strings.ReplaceAll(text, marker[0], "")
+		text = strings.ReplaceAll(text, marker[1], "")
+	}
+	return text
+}
+
+func stripVolatileDocumentContext(text string) string {
+	for _, marker := range [][2]string{
+		{documentTitlePromptStart, documentTitlePromptEnd},
+		{documentDocumentTitleStart, documentDocumentTitleEnd},
+	} {
+		for {
+			start := strings.Index(text, marker[0])
+			if start < 0 {
+				break
+			}
+			contentStart := start + len(marker[0])
+			end := strings.Index(text[contentStart:], marker[1])
+			if end < 0 {
+				break
+			}
+			text = text[:start] + text[contentStart+end+len(marker[1]):]
+		}
+	}
+	lines := strings.Split(text, "\n")
+	filtered := make([]string, 0, len(lines))
+	inMetadata := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.EqualFold(trimmed, "Document Metadata:") {
+			inMetadata = true
+			filtered = append(filtered, line)
+			continue
+		}
+		if inMetadata && strings.HasPrefix(trimmed, "Title:") {
+			continue
+		}
+		if inMetadata && trimmed == "" {
+			inMetadata = false
+		}
+		filtered = append(filtered, line)
+	}
+	return strings.Join(filtered, "\n")
 }
 
 func normalizeDocumentTitle(title string) string {
@@ -218,6 +296,8 @@ func documentSemanticProjection(value any) any {
 			out[i] = documentSemanticProjection(child)
 		}
 		return out
+	case string:
+		return stripVolatileDocumentContext(typed)
 	default:
 		return value
 	}
@@ -228,6 +308,18 @@ func documentSemanticProjection(value any) any {
 // live binding components. R4: binding validation completes INSIDE
 // acquireDocumentSession, so the hit decision (and its incremental payload)
 // is final before the caller starts any prompt build.
+func documentLaneBackpressureError(err error) error {
+	if !errors.Is(err, helps.ErrDocumentLaneBusy) {
+		return err
+	}
+	retryAfter := time.Second
+	return statusErr{
+		code:       http.StatusTooManyRequests,
+		msg:        "ACP document lane is busy; retry the request",
+		retryAfter: &retryAfter,
+	}
+}
+
 type documentAcquire struct {
 	info        documentRequestInfo
 	authKey     string
@@ -254,12 +346,12 @@ func (e *AntigravityAcpExecutor) acquireDocumentSession(ctx context.Context, aut
 	if e.pool == nil || e.document == nil {
 		return documentAcquire{info: info, authKey: authKey, variant: variant, releaseLane: noRelease}, nil
 	}
-	releaseLane, laneErr := e.document.AcquireLane(info.key, ctx, 0)
+	releaseLane, laneErr := e.document.AcquireLane(info.key, ctx, e.documentLaneMaxWaiters)
 	if laneErr != nil {
 		// R2 backpressure: the per-document queue is full (or the client
 		// went away). Return a retryable error instead of creating another
 		// ACP session behind an unbounded wait queue.
-		return documentAcquire{info: info, authKey: authKey, variant: variant, releaseLane: func() {}}, laneErr
+		return documentAcquire{info: info, authKey: authKey, variant: variant, releaseLane: func() {}}, documentLaneBackpressureError(laneErr)
 	}
 	acq := documentAcquire{info: info, authKey: authKey, variant: variant, releaseLane: releaseLane}
 	binding, ok := e.document.Lookup(info.key, nil, authKey, variant)

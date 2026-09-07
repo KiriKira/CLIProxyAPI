@@ -75,7 +75,70 @@ func TestAntigravityAcpPool_R1SingleWorkerFreshProgressAfterCap(t *testing.T) {
 	pool.Release(w2, true)
 }
 
-// TestAntigravityAcpPool_R1ForcedRetirementPurgesBindingsViaHook verifies
+// TestAntigravityAcpPool_R1bWaitsForProcessTreeBeforeReplacement verifies
+// that hard worker capacity is not handed to a replacement until the retired
+// worker's owned process-tree close has completed.
+func TestAntigravityAcpPool_R1bWaitsForProcessTreeBeforeReplacement(t *testing.T) {
+	pool := r1TestPool(t, 1, nil)
+	closeStarted := make(chan struct{}, 1)
+	allowClose := make(chan struct{})
+	pool.closeWorkerAndWait = func(ctx context.Context, client *acp.Client) error {
+		closeStarted <- struct{}{}
+		<-allowClose
+		return nil
+	}
+
+	w1, err := pool.Acquire(context.Background(), "k1", nil)
+	if err != nil {
+		t.Fatalf("acquire initial worker: %v", err)
+	}
+	fillToSessionCap(t, pool, w1, 1)
+	pool.Release(w1, true)
+
+	acquireCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	replacementStarted := make(chan struct{}, 1)
+	acquired := make(chan *AntigravityAcpWorker, 1)
+	acquireErr := make(chan error, 1)
+	go func() {
+		w2, errAcquire := pool.Acquire(acquireCtx, "k1", func(ctx context.Context) (*acp.Client, error) {
+			replacementStarted <- struct{}{}
+			return &acp.Client{}, nil
+		})
+		if errAcquire != nil {
+			acquireErr <- errAcquire
+			return
+		}
+		acquired <- w2
+	}()
+
+	select {
+	case <-closeStarted:
+	case errAcquire := <-acquireErr:
+		t.Fatalf("replacement acquire failed before cleanup completed: %v", errAcquire)
+	case <-time.After(2 * time.Second):
+		t.Fatal("retirement did not start process-tree close")
+	}
+	select {
+	case <-replacementStarted:
+		t.Fatal("replacement spawned before old process-tree cleanup completed")
+	default:
+	}
+
+	close(allowClose)
+	select {
+	case w2 := <-acquired:
+		if w2 == w1 {
+			t.Fatal("replacement acquire returned retired worker")
+		}
+		pool.Release(w2, true)
+	case errAcquire := <-acquireErr:
+		t.Fatalf("replacement acquire after cleanup failed: %v", errAcquire)
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement did not start after process-tree cleanup completed")
+	}
+}
+
 // that a forced retirement of an idle draining worker invokes the retired
 // hook exactly once, so the owner can purge strict/document bindings.
 func TestAntigravityAcpPool_R1ForcedRetirementPurgesBindingsViaHook(t *testing.T) {

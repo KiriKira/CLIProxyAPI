@@ -1,7 +1,9 @@
 package executor
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -67,6 +69,63 @@ func TestDocumentRequestSemanticAndExplicitIdentityIsolation(t *testing.T) {
 	}
 	if !strings.Contains(three.key, "document:") {
 		t.Fatalf("explicit document id did not produce a document key: %s", three.key)
+	}
+}
+
+func TestDocumentSemanticFingerprintStripsVolatileSystemTitle(t *testing.T) {
+	signals := documentSignals{enabled: true, client: "immersive-translate"}
+	build := func(counter, instruction string) []byte {
+		return []byte(`{"messages":[{"role":"system","content":"` + instruction + `\n[[CLIPROXY_ACP_TITLE_PROMPT:v1]]\nTitle: \"(` + counter + `) Demo - YouTube\"\n[[/CLIPROXY_ACP_TITLE_PROMPT]]\nsummary/terms"},{"role":"user","content":"batch"}]}`)
+	}
+	one, err := prepareDocumentRequest(build("132", "translate to English"), "auth", "model", signals, "openai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	two, err := prepareDocumentRequest(build("133", "translate to English"), "auth", "model", signals, "openai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if one.key != two.key {
+		t.Fatalf("volatile system title changed document key: %q != %q", one.key, two.key)
+	}
+	three, err := prepareDocumentRequest(build("133", "translate to Japanese"), "auth", "model", signals, "openai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if two.key == three.key {
+		t.Fatal("stable translation instruction did not rotate document key")
+	}
+}
+
+func TestDocumentDirectTitleMarkerIsSupported(t *testing.T) {
+	signals := documentSignals{enabled: true, client: "immersive-translate"}
+	payload := []byte(`{"messages":[{"role":"system","content":"translate"},{"role":"user","content":"[[CLIPROXY_ACP_DOCUMENT_TITLE:v1]]\nDemo - YouTube\n[[/CLIPROXY_ACP_DOCUMENT_TITLE]]\nbatch"}]}`)
+	info, err := prepareDocumentRequest(payload, "auth", "model", signals, "openai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.title != "Demo - YouTube" {
+		t.Fatalf("direct title marker = %q, want Demo - YouTube", info.title)
+	}
+	if strings.Contains(string(info.cleanedPayload), documentDocumentTitleStart) || strings.Contains(string(info.cleanedPayload), documentDocumentTitleEnd) {
+		t.Fatalf("direct marker delimiters leaked into cleaned payload: %s", info.cleanedPayload)
+	}
+}
+
+func TestDocumentLaneOverflowMapsToRetryable429(t *testing.T) {
+	err := documentLaneBackpressureError(helps.ErrDocumentLaneBusy)
+	status, ok := err.(statusErr)
+	if !ok {
+		t.Fatalf("lane overflow error type = %T, want statusErr", err)
+	}
+	if status.code != http.StatusTooManyRequests {
+		t.Fatalf("lane overflow status = %d, want %d", status.code, http.StatusTooManyRequests)
+	}
+	if status.retryAfter == nil || *status.retryAfter != time.Second {
+		t.Fatalf("lane overflow retry-after = %v, want 1s", status.retryAfter)
+	}
+	if got := documentLaneBackpressureError(context.Canceled); got != context.Canceled {
+		t.Fatalf("non-lane error was remapped: %v", got)
 	}
 }
 
