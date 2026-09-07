@@ -87,6 +87,16 @@ const (
 	// ACPStatefulTurnMetadataKey (int64) stores the monotonic X-ACP-Session-Turn
 	// index used for duplicate/skip protection on stateful reuse.
 	ACPStatefulTurnMetadataKey = "acp_stateful_turn"
+	// ACPDocumentReuseMetadataKey records explicit X-ACP-Session-Reuse: 1 for
+	// document-affinity mode, which does not require a logical session id/turn.
+	ACPDocumentReuseMetadataKey = "acp_document_reuse"
+	// ACPDocumentScopeMetadataKey records X-ACP-Session-Scope: document.
+	ACPDocumentScopeMetadataKey = "acp_document_scope"
+	// ACPDocumentClientMetadataKey carries the diagnostic/profile label from
+	// X-ACP-Client without making that label the semantic switch.
+	ACPDocumentClientMetadataKey = "acp_document_client"
+	// ACPDocumentIDMetadataKey carries an optional explicit document id.
+	ACPDocumentIDMetadataKey = "acp_document_id"
 )
 
 // Request encapsulates the translated payload that will be sent to a provider executor.

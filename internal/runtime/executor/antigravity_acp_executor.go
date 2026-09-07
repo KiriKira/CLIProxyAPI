@@ -40,6 +40,10 @@ type AntigravityAcpExecutor struct {
 	// (PLAN Phase 1). Nil when the pool is not persistent; requests without
 	// the X-ACP-Session-Reuse signal never touch it.
 	stateful *helps.StatefulSessionTable
+	// document holds explicit page/document-affinity bindings. It is separate
+	// from strict turn-based stateful reuse because document clients send no
+	// monotonic turn or full history.
+	document *helps.DocumentSessionTable
 }
 
 func (e *AntigravityAcpExecutor) authPoolKey(auth *cliproxyauth.Auth) string {
@@ -117,6 +121,7 @@ func NewAntigravityAcpExecutor(cfg *internalconfig.Config) *AntigravityAcpExecut
 			maxBindings = cfg.Antigravity.MaxStatefulSessions
 		}
 		exec.stateful = helps.NewStatefulSessionTable(statefulTTL, maxBindings)
+		exec.document = helps.NewDocumentSessionTable(statefulTTL, maxBindings)
 	}
 
 	return exec
@@ -1249,6 +1254,12 @@ func (s *acpTTFTStage) markSessionSetup(newDone, modelDone time.Time, mode strin
 	s.mu.Unlock()
 }
 
+func (s *acpTTFTStage) markSessionMode(mode string) {
+	s.mu.Lock()
+	s.sessionMode = mode
+	s.mu.Unlock()
+}
+
 // markSessionNewDone stamps only the session/new boundary (failure paths).
 func (s *acpTTFTStage) markSessionNewDone(t time.Time) {
 	s.mu.Lock()
@@ -1406,18 +1417,42 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 
 	stages := &acpTTFTStage{requestEnter: time.Now()}
 	signals := statefulTurnSignalsFromOptions(opts)
+	documentSignals := documentSignalsFromOptions(opts)
+	documentMode := documentSignals.enabled
 
 	var client *acp.Client
 	var worker *helps.AntigravityAcpWorker
 	var authKey string
 	var resolvedVariant string
-	// statefulHit marks a validated stateful cache hit: the bound session is
-	// reused, only the incremental turn is prompted, and the binding's turn
-	// advances only after a successful prompt (P1.2/P1.4).
+	var documentKey string
+	var documentInfo documentRequestInfo
+	// statefulHit is shared by the execution core for both strict stateful
+	// hits and document-affinity hits; documentHit selects the binding table.
 	statefulHit := false
+	documentHit := false
 	promptPayload := req.Payload
 
-	if e.pool != nil {
+	if documentMode {
+		info, releaseLane, key, documentWorker, documentClient, variant, hit, documentErr := e.acquireDocumentSession(ctx, auth, req, opts, stages)
+		if documentErr != nil {
+			return resp, documentErr
+		}
+		documentInfo = info
+		defer releaseLane()
+		authKey = key
+		resolvedVariant = variant
+		promptPayload = info.cleanedPayload
+		documentKey = info.key
+		if hit {
+			worker = documentWorker
+			client = documentClient
+			statefulHit = true
+			documentHit = true
+			promptPayload = info.incrementalBody
+		}
+	}
+
+	if !documentMode && e.pool != nil {
 		authKey = e.authPoolKey(auth)
 		if signals.reuse && e.stateful != nil {
 			w, _, variant, hit, acqErr := e.acquireStatefulSession(ctx, auth, signals, req.Model, req.Payload, stages)
@@ -1473,6 +1508,10 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 	healthy := true
 	defer func() {
 		if worker != nil {
+			if !healthy {
+				e.stateful.PurgeWorker(worker)
+				e.document.PurgeWorker(worker)
+			}
 			e.pool.Release(worker, healthy)
 		}
 	}()
@@ -1495,21 +1534,35 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 
 	sessionID := ""
 	if statefulHit {
-		// Continue the bound ACP session directly.
-		binding, ok := e.stateful.Lookup(logicalLookupKey(signals.logicalID, authKey), worker, authKey, resolvedVariant)
-		if !ok {
-			// Raced invalidation between acquire and here: redo statelessly.
-			statefulHit = false
+		if documentHit {
+			binding, ok := e.document.Lookup(documentKey, worker, authKey, resolvedVariant)
+			if !ok {
+				statefulHit = false
+				documentHit = false
+				promptPayload = documentInfo.cleanedPayload
+			} else {
+				sessionID = binding.ACPSessionID
+			}
 		} else {
-			sessionID = binding.ACPSessionID
-			if resolvedVariant == "" {
-				resolvedVariant = resolveAntigravityModel(req.Model, req.Payload)
+			// Continue the bound strict ACP session directly.
+			binding, ok := e.stateful.Lookup(logicalLookupKey(signals.logicalID, authKey), worker, authKey, resolvedVariant)
+			if !ok {
+				// Raced invalidation between acquire and here: redo statelessly.
+				statefulHit = false
+			} else {
+				sessionID = binding.ACPSessionID
+				if resolvedVariant == "" {
+					resolvedVariant = resolveAntigravityModel(req.Model, req.Payload)
+				}
 			}
 		}
 	}
 	if !statefulHit {
 		var err error
 		sessionID, _, resolvedVariant, err = openSession(ctx, client, worker, req.Model, req.Payload, stages)
+		if documentMode {
+			stages.markSessionMode("document_bootstrap")
+		}
 		if err != nil {
 			if acp.IsTransportError(err) {
 				healthy = false
@@ -1599,15 +1652,21 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 		if worker != nil && !statefulHit {
 			worker.AbandonSession(sessionID)
 		}
-		if statefulHit && signals.reuse {
-			// Ambiguous provider-side state after a failed continued turn:
-			// invalidate so the next request bootstraps from full history
-			// (P1.4). Never advance the binding turn.
-			e.invalidateStateful(signals, authKey)
+		if statefulHit {
+			if documentHit {
+				e.document.Invalidate(documentKey)
+			} else if signals.reuse {
+				// Ambiguous provider-side state after a failed continued turn:
+				// invalidate so the next request bootstraps from full history
+				// (P1.4). Never advance the binding turn.
+				e.invalidateStateful(signals, authKey)
+			}
 		}
 		return resp, statusErr{code: http.StatusInternalServerError, msg: fmt.Sprintf("ACP prompt error: %v", err)}
 	}
-	if signals.reuse {
+	if documentMode && worker != nil {
+		e.document.Bind(documentKey, sessionID, authKey, resolvedVariant, worker)
+	} else if signals.reuse {
 		// P1.2/P1.4: bind after a successful prompt — both a bootstrapped
 		// first turn (creates the binding) and a continued turn (advances
 		// LastTurn). A canceled/failed prompt never reaches this line.
@@ -1665,15 +1724,42 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 
 	stages := &acpTTFTStage{requestEnter: time.Now()}
 	signals := statefulTurnSignalsFromOptions(opts)
+	documentSignals := documentSignalsFromOptions(opts)
+	documentMode := documentSignals.enabled
 
 	var client *acp.Client
 	var worker *helps.AntigravityAcpWorker
 	var authKey string
 	var resolvedVariant string
+	var documentKey string
+	var documentInfo documentRequestInfo
+	var releaseDocumentLane = func() {}
+	var documentLaneOnce sync.Once
 	statefulHit := false
+	documentHit := false
 	promptPayload := req.Payload
 
-	if e.pool != nil {
+	if documentMode {
+		info, releaseLane, key, documentWorker, documentClient, variant, hit, documentErr := e.acquireDocumentSession(ctx, auth, req, opts, stages)
+		if documentErr != nil {
+			return nil, documentErr
+		}
+		documentInfo = info
+		releaseDocumentLane = func() { documentLaneOnce.Do(releaseLane) }
+		authKey = key
+		resolvedVariant = variant
+		promptPayload = info.cleanedPayload
+		documentKey = info.key
+		if hit {
+			worker = documentWorker
+			client = documentClient
+			statefulHit = true
+			documentHit = true
+			promptPayload = info.incrementalBody
+		}
+	}
+
+	if !documentMode && e.pool != nil {
 		authKey = e.authPoolKey(auth)
 		if signals.reuse && e.stateful != nil {
 			w, _, variant, hit, acqErr := e.acquireStatefulSession(ctx, auth, signals, req.Model, req.Payload, stages)
@@ -1706,6 +1792,7 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 			return e.spawnClient(spawnCtx, auth)
 		})
 		if acqErr != nil {
+			releaseDocumentLane()
 			return nil, acqErr
 		}
 		worker = w
@@ -1713,6 +1800,7 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 	} else if worker == nil {
 		c, spawnErr := e.spawnClient(ctx, auth)
 		if spawnErr != nil {
+			releaseDocumentLane()
 			return nil, spawnErr
 		}
 		client = c
@@ -1737,19 +1825,33 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 
 	sessionID := ""
 	if statefulHit {
-		binding, ok := e.stateful.Lookup(logicalLookupKey(signals.logicalID, authKey), worker, authKey, resolvedVariant)
-		if !ok {
-			statefulHit = false
+		if documentHit {
+			binding, ok := e.document.Lookup(documentKey, worker, authKey, resolvedVariant)
+			if !ok {
+				statefulHit = false
+				documentHit = false
+				promptPayload = documentInfo.cleanedPayload
+			} else {
+				sessionID = binding.ACPSessionID
+			}
 		} else {
-			sessionID = binding.ACPSessionID
-			if resolvedVariant == "" {
-				resolvedVariant = resolveAntigravityModel(req.Model, req.Payload)
+			binding, ok := e.stateful.Lookup(logicalLookupKey(signals.logicalID, authKey), worker, authKey, resolvedVariant)
+			if !ok {
+				statefulHit = false
+			} else {
+				sessionID = binding.ACPSessionID
+				if resolvedVariant == "" {
+					resolvedVariant = resolveAntigravityModel(req.Model, req.Payload)
+				}
 			}
 		}
 	}
 	if !statefulHit {
 		var err error
 		sessionID, _, resolvedVariant, err = openSession(ctx, client, worker, req.Model, req.Payload, stages)
+		if documentMode {
+			stages.markSessionMode("document_bootstrap")
+		}
 		if err != nil {
 			if worker != nil {
 				e.pool.Release(worker, !acp.IsTransportError(err))
@@ -1762,6 +1864,7 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 			if pr := <-promptCh; pr.cleanup != nil {
 				pr.cleanup()
 			}
+			releaseDocumentLane()
 			return nil, err
 		}
 	}
@@ -1786,9 +1889,14 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 	}
 
 	go func() {
+		defer releaseDocumentLane()
 		healthy := true
 		defer func() {
 			if worker != nil {
+				if !healthy {
+					e.stateful.PurgeWorker(worker)
+					e.document.PurgeWorker(worker)
+				}
 				e.pool.Release(worker, healthy)
 			} else {
 				client.Close()
@@ -1871,10 +1979,14 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 			if worker != nil && !statefulHit {
 				worker.AbandonSession(sessionID)
 			}
-			if statefulHit && signals.reuse {
-				// Ambiguous provider-side state after a failed continued
-				// turn: invalidate so the next request bootstraps (P1.4).
-				e.invalidateStateful(signals, authKey)
+			if statefulHit {
+				if documentHit {
+					e.document.Invalidate(documentKey)
+				} else if signals.reuse {
+					// Ambiguous provider-side state after a failed continued
+					// turn: invalidate so the next request bootstraps (P1.4).
+					e.invalidateStateful(signals, authKey)
+				}
 			}
 			log.Errorf("ACP prompt stream error: %v", promptErr)
 			chunkChan <- cliproxyexecutor.StreamChunk{
@@ -1882,7 +1994,9 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 			}
 			return
 		}
-		if signals.reuse {
+		if documentMode && worker != nil {
+			e.document.Bind(documentKey, sessionID, authKey, resolvedVariant, worker)
+		} else if signals.reuse {
 			// P1.2/P1.4: bind after a successful prompt — both a bootstrapped
 			// first turn and a continued turn (advances LastTurn).
 			e.bindStatefulTurn(signals, authKey, sessionID, resolvedVariant, worker, signals.turn)

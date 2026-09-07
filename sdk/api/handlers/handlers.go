@@ -212,6 +212,18 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 				}
 			}
 		}
+		if strings.EqualFold(strings.TrimSpace(ginCtx.GetHeader("X-ACP-Session-Scope")), "document") {
+			meta[coreexecutor.ACPDocumentScopeMetadataKey] = true
+			if ginCtx.GetHeader("X-ACP-Session-Reuse") == "1" {
+				meta[coreexecutor.ACPDocumentReuseMetadataKey] = true
+			}
+			if client := strings.TrimSpace(ginCtx.GetHeader("X-ACP-Client")); client != "" {
+				meta[coreexecutor.ACPDocumentClientMetadataKey] = client
+			}
+			if documentID := strings.TrimSpace(ginCtx.GetHeader("X-ACP-Document-ID")); documentID != "" {
+				meta[coreexecutor.ACPDocumentIDMetadataKey] = documentID
+			}
+		}
 	}
 	return meta
 }
