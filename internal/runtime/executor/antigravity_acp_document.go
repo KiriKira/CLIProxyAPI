@@ -321,14 +321,15 @@ func documentLaneBackpressureError(err error) error {
 }
 
 type documentAcquire struct {
-	info        documentRequestInfo
-	authKey     string
-	variant     string
-	sessionID   string // bound ACP session; valid only when hit
-	worker      *helps.AntigravityAcpWorker
-	client      *acp.Client
-	hit         bool
-	releaseLane func()
+	info         documentRequestInfo
+	authKey      string
+	variant      string
+	sessionID    string // bound ACP session; valid only when hit
+	worker       *helps.AntigravityAcpWorker
+	client       *acp.Client
+	hit          bool
+	releaseLane  func()
+	releaseLease func()
 }
 
 func (e *AntigravityAcpExecutor) acquireDocumentSession(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stages *acpTTFTStage) (documentAcquire, error) {
@@ -371,6 +372,12 @@ func (e *AntigravityAcpExecutor) acquireDocumentSession(ctx context.Context, aut
 		e.pool.Release(worker, true)
 		return acq, nil
 	}
+	releaseLease, leased := e.document.AcquireLease(info.key, worker, authKey, variant)
+	if !leased {
+		e.pool.Release(worker, true)
+		return acq, nil
+	}
+	acq.releaseLease = releaseLease
 	now := time.Now()
 	stages.markPoolAcquired()
 	stages.markSessionSetup(now, now, "document_reuse")

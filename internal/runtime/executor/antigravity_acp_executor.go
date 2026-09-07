@@ -1440,6 +1440,7 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 	var resolvedVariant string
 	var documentKey string
 	statefulHit := false
+	var releaseStatefulLease func()
 	documentHit := false
 	promptPayload := req.Payload
 
@@ -1449,6 +1450,9 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 			return resp, documentErr
 		}
 		defer acq.releaseLane()
+		if acq.releaseLease != nil {
+			defer acq.releaseLease()
+		}
 		// R4: the hit decision is final here — the incremental payload is
 		// selected BEFORE the prompt builder below is ever started.
 		authKey = acq.authKey
@@ -1478,6 +1482,7 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 					worker = acq.worker
 					client = acq.worker.Client()
 					statefulHit = true
+					releaseStatefulLease = acq.releaseLease
 					promptPayload = turnPayload
 					resolvedVariant = acq.variant
 					// A hit performs no session/new and no model config:
@@ -1491,6 +1496,9 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 				}
 			}
 		}
+	}
+	if releaseStatefulLease != nil {
+		defer releaseStatefulLease()
 	}
 
 	if worker == nil && e.pool != nil {
@@ -1729,7 +1737,9 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 	var resolvedVariant string
 	var documentKey string
 	var releaseDocumentLane = func() {}
+	var releaseDocumentLease func()
 	statefulHit := false
+	var releaseStatefulLease func()
 	documentHit := false
 	promptPayload := req.Payload
 
@@ -1739,6 +1749,7 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 			return nil, documentErr
 		}
 		releaseDocumentLane = acq.releaseLane
+		releaseDocumentLease = acq.releaseLease
 		// R4: the hit decision is final here — the incremental payload is
 		// selected BEFORE the prompt builder below is ever started.
 		authKey = acq.authKey
@@ -1754,6 +1765,9 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 			promptPayload = acq.info.incrementalBody
 		}
 	}
+	if releaseDocumentLease != nil {
+		defer releaseDocumentLease()
+	}
 
 	if !documentMode && e.pool != nil {
 		authKey = e.authPoolKey(auth)
@@ -1768,6 +1782,7 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 					worker = acq.worker
 					client = acq.worker.Client()
 					statefulHit = true
+					releaseStatefulLease = acq.releaseLease
 					promptPayload = turnPayload
 					resolvedVariant = acq.variant
 					now := time.Now()
@@ -1777,6 +1792,9 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 				}
 			}
 		}
+	}
+	if releaseStatefulLease != nil {
+		defer releaseStatefulLease()
 	}
 
 	if worker == nil && e.pool != nil {

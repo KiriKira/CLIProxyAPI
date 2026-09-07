@@ -20,9 +20,11 @@ type DocumentACPBinding struct {
 }
 
 type documentBindingEntry struct {
-	key      string
-	binding  *DocumentACPBinding
-	deadline time.Time
+	key             string
+	binding         *DocumentACPBinding
+	deadline        time.Time
+	activeLeases    int
+	evictionPending bool
 }
 
 // DocumentSessionTable is a bounded document-key -> ACP-session registry.
@@ -187,13 +189,23 @@ func (t *DocumentSessionTable) LockLane(key string) func() {
 	return lane.Unlock
 }
 
-func (t *DocumentSessionTable) removeLocked(el *list.Element) {
+func (t *DocumentSessionTable) removeElementLocked(el *list.Element) {
 	entry := el.Value.(*documentBindingEntry)
 	t.lru.Remove(el)
 	delete(t.m, entry.key)
 	if entry.binding != nil && entry.binding.Worker != nil {
 		entry.binding.Worker.AbandonSession(entry.binding.ACPSessionID)
 	}
+}
+
+func (t *DocumentSessionTable) removeLocked(el *list.Element) bool {
+	entry := el.Value.(*documentBindingEntry)
+	if entry.activeLeases > 0 {
+		entry.evictionPending = true
+		return false
+	}
+	t.removeElementLocked(el)
+	return true
 }
 
 func (t *DocumentSessionTable) getLocked(key string) (*DocumentACPBinding, bool) {
@@ -203,7 +215,11 @@ func (t *DocumentSessionTable) getLocked(key string) (*DocumentACPBinding, bool)
 	}
 	entry := el.Value.(*documentBindingEntry)
 	if t.ttl > 0 && time.Now().After(entry.deadline) {
-		t.removeLocked(el)
+		if entry.activeLeases > 0 {
+			entry.evictionPending = true
+			return entry.binding, true
+		}
+		t.removeElementLocked(el)
 		return nil, false
 	}
 	return entry.binding, true
@@ -224,7 +240,7 @@ func (t *DocumentSessionTable) Lookup(key string, worker *AntigravityAcpWorker, 
 	}
 	el := t.m[key]
 	if binding.Worker == nil || (worker != nil && binding.Worker != worker) || binding.AuthKey != authKey || (modelVariant != "" && binding.ModelVariant != modelVariant) {
-		t.removeLocked(el)
+		t.removeElementLocked(el)
 		return nil, false
 	}
 	if t.ttl > 0 {
@@ -283,7 +299,7 @@ func (t *DocumentSessionTable) Invalidate(key string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if el, ok := t.m[key]; ok {
-		t.removeLocked(el)
+		t.removeElementLocked(el)
 	}
 }
 
@@ -301,7 +317,7 @@ func (t *DocumentSessionTable) PurgeWorker(worker *AntigravityAcpWorker) {
 		}
 	}
 	for _, el := range doomed {
-		t.removeLocked(el)
+		t.removeElementLocked(el)
 	}
 }
 
@@ -315,7 +331,7 @@ func (t *DocumentSessionTable) PurgeAll() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	for el := t.lru.Front(); el != nil; el = t.lru.Front() {
-		t.removeLocked(el)
+		t.removeElementLocked(el)
 	}
 }
 
@@ -331,8 +347,48 @@ func (t *StatefulSessionTable) InvalidateAllForTest() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	for el := t.lru.Front(); el != nil; el = t.lru.Front() {
-		t.removeLocked(el)
+		t.removeElementLocked(el)
 	}
+}
+
+// AcquireLease pins a live document binding while its worker/session is used
+// by a request. LRU/TTL eviction defers until the returned release function.
+func (t *DocumentSessionTable) AcquireLease(key string, worker *AntigravityAcpWorker, authKey, modelVariant string) (func(), bool) {
+	if t == nil || key == "" {
+		return func() {}, false
+	}
+	t.mu.Lock()
+	el, ok := t.m[key]
+	if !ok {
+		t.mu.Unlock()
+		return func() {}, false
+	}
+	entry := el.Value.(*documentBindingEntry)
+	if entry.binding == nil || entry.binding.Worker != worker || entry.binding.AuthKey != authKey || (modelVariant != "" && entry.binding.ModelVariant != modelVariant) {
+		t.mu.Unlock()
+		return func() {}, false
+	}
+	entry.activeLeases++
+	t.mu.Unlock()
+	return func() { t.releaseLease(key, el) }, true
+}
+
+func (t *DocumentSessionTable) releaseLease(key string, el *list.Element) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	current, ok := t.m[key]
+	if !ok || current != el {
+		return
+	}
+	entry := el.Value.(*documentBindingEntry)
+	if entry.activeLeases > 0 {
+		entry.activeLeases--
+	}
+	if entry.activeLeases == 0 && entry.evictionPending {
+		t.removeElementLocked(el)
+		return
+	}
+	t.enforceBoundLocked()
 }
 
 func (t *DocumentSessionTable) Len() int {
@@ -349,10 +405,18 @@ func (t *DocumentSessionTable) enforceBoundLocked() {
 		return
 	}
 	for t.lru.Len() > t.max {
-		back := t.lru.Back()
-		if back == nil {
+		var candidate *list.Element
+		for el := t.lru.Back(); el != nil; el = el.Prev() {
+			entry := el.Value.(*documentBindingEntry)
+			if entry.activeLeases == 0 {
+				candidate = el
+				break
+			}
+			entry.evictionPending = true
+		}
+		if candidate == nil {
 			return
 		}
-		t.removeLocked(back)
+		t.removeLocked(candidate)
 	}
 }

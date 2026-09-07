@@ -139,3 +139,24 @@ func TestDocumentLane_ColdBurstSingleflights(t *testing.T) {
 		t.Fatalf("bootstraps = %d, want 10 sequential sections", got)
 	}
 }
+
+func TestDocumentTable_ActiveLeaseDefersLRUEviction(t *testing.T) {
+	table := NewDocumentSessionTable(0, 1)
+	worker := &AntigravityAcpWorker{}
+	table.Bind("document-a", "session-a", "auth", "model", worker)
+	release, ok := table.AcquireLease("document-a", worker, "auth", "model")
+	if !ok {
+		t.Fatal("AcquireLease(document-a) failed")
+	}
+	table.Bind("document-b", "session-b", "auth", "model", worker)
+	if got := table.Len(); got != 1 {
+		t.Fatalf("binding count while active lease = %d, want 1", got)
+	}
+	if _, ok := table.Lookup("document-a", worker, "auth", "model"); !ok {
+		t.Fatal("active document binding was evicted while leased")
+	}
+	release()
+	if got := table.Len(); got != 0 {
+		t.Fatalf("binding count after deferred eviction = %d, want 0", got)
+	}
+}

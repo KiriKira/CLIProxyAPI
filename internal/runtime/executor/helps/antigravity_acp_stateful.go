@@ -48,10 +48,12 @@ type StatefulSessionTable struct {
 
 // bindingEntry pairs the key with its binding inside the LRU list.
 type bindingEntry struct {
-	key      string
-	binding  *StatefulACPBinding
-	worker   *AntigravityAcpWorker
-	deadline time.Time
+	key             string
+	binding         *StatefulACPBinding
+	worker          *AntigravityAcpWorker
+	deadline        time.Time
+	activeLeases    int
+	evictionPending bool
 }
 
 // NewStatefulSessionTable builds a table with the given TTL and LRU bound.
@@ -73,20 +75,37 @@ func (t *StatefulSessionTable) getLocked(logicalSessionID string) (*StatefulACPB
 	}
 	entry := el.Value.(*bindingEntry)
 	if t.ttl > 0 && time.Now().After(entry.deadline) {
-		t.removeLocked(el)
+		if entry.activeLeases > 0 {
+			entry.evictionPending = true
+			return entry.binding, true
+		}
+		t.removeElementLocked(el)
 		return nil, false
 	}
 	return entry.binding, true
 }
 
-// removeLocked drops one element and its map entry. Callers hold mu.
-func (t *StatefulSessionTable) removeLocked(el *list.Element) {
+// removeElementLocked drops one element and its map entry without considering
+// active leases. Callers hold mu and use it for explicit invalidation/death.
+func (t *StatefulSessionTable) removeElementLocked(el *list.Element) {
 	entry := el.Value.(*bindingEntry)
 	t.lru.Remove(el)
 	delete(t.m, entry.key)
 	if entry.worker != nil && entry.binding != nil {
 		entry.worker.AbandonSession(entry.binding.ACPSessionID)
 	}
+}
+
+// removeLocked drops one idle element. An actively leased binding is pinned
+// and marked for deferred eviction (R9).
+func (t *StatefulSessionTable) removeLocked(el *list.Element) bool {
+	entry := el.Value.(*bindingEntry)
+	if entry.activeLeases > 0 {
+		entry.evictionPending = true
+		return false
+	}
+	t.removeElementLocked(el)
+	return true
 }
 
 // WorkerOf returns the worker currently owning the binding for a key,
@@ -125,7 +144,7 @@ func (t *StatefulSessionTable) Lookup(key string, worker *AntigravityAcpWorker, 
 		(modelVariant != "" && b.ModelVariant != modelVariant) ||
 		b.worker == nil
 	if invalid {
-		t.removeLocked(el)
+		t.removeElementLocked(el)
 		return nil, false
 	}
 	if t.ttl > 0 {
@@ -193,7 +212,7 @@ func (t *StatefulSessionTable) Invalidate(logicalSessionID string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if el, ok := t.m[logicalSessionID]; ok {
-		t.removeLocked(el)
+		t.removeElementLocked(el)
 	}
 }
 
@@ -205,11 +224,19 @@ func (t *StatefulSessionTable) enforceBoundLocked() {
 		return
 	}
 	for t.lru.Len() > t.max {
-		back := t.lru.Back()
-		if back == nil {
+		var candidate *list.Element
+		for el := t.lru.Back(); el != nil; el = el.Prev() {
+			entry := el.Value.(*bindingEntry)
+			if entry.activeLeases == 0 {
+				candidate = el
+				break
+			}
+			entry.evictionPending = true
+		}
+		if candidate == nil {
 			return
 		}
-		t.removeLocked(back)
+		t.removeLocked(candidate)
 	}
 }
 
@@ -230,11 +257,50 @@ func (t *StatefulSessionTable) PurgeWorker(worker *AntigravityAcpWorker) {
 		}
 	}
 	for _, el := range doomed {
-		t.removeLocked(el)
+		t.removeElementLocked(el)
 	}
 }
 
-// Len reports the number of live bindings (diagnostics/tests).
+// AcquireLease pins a live binding while its owning worker/session is used by
+// a request. LRU/TTL eviction defers until the returned release function runs.
+func (t *StatefulSessionTable) AcquireLease(key string, worker *AntigravityAcpWorker, authKey, modelVariant string) (func(), bool) {
+	if t == nil || key == "" {
+		return func() {}, false
+	}
+	t.mu.Lock()
+	el, ok := t.m[key]
+	if !ok {
+		t.mu.Unlock()
+		return func() {}, false
+	}
+	entry := el.Value.(*bindingEntry)
+	if entry.binding == nil || entry.worker != worker || entry.binding.AuthKey != authKey || (modelVariant != "" && entry.binding.ModelVariant != modelVariant) {
+		t.mu.Unlock()
+		return func() {}, false
+	}
+	entry.activeLeases++
+	t.mu.Unlock()
+	return func() { t.releaseLease(key, el) }, true
+}
+
+func (t *StatefulSessionTable) releaseLease(key string, el *list.Element) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	current, ok := t.m[key]
+	if !ok || current != el {
+		return
+	}
+	entry := el.Value.(*bindingEntry)
+	if entry.activeLeases > 0 {
+		entry.activeLeases--
+	}
+	if entry.activeLeases == 0 && entry.evictionPending {
+		t.removeElementLocked(el)
+		return
+	}
+	t.enforceBoundLocked()
+}
+
 func (t *StatefulSessionTable) Len() int {
 	if t == nil {
 		return 0

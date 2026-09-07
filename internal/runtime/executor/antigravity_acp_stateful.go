@@ -121,10 +121,11 @@ func statefulIncrementalTurn(payload []byte) ([]byte, error) {
 // returned hit is final and the incremental payload decision belongs to the
 // caller BEFORE any prompt build starts.
 type statefulAcquire struct {
-	worker    *helps.AntigravityAcpWorker
-	sessionID string
-	variant   string
-	hit       bool
+	worker       *helps.AntigravityAcpWorker
+	sessionID    string
+	variant      string
+	hit          bool
+	releaseLease func()
 }
 
 func (e *AntigravityAcpExecutor) acquireStatefulSession(ctx context.Context, auth *cliproxyauth.Auth, signals statefulTurnSignals, model string, payload []byte, stages *acpTTFTStage) (statefulAcquire, error) {
@@ -174,6 +175,12 @@ func (e *AntigravityAcpExecutor) acquireStatefulSession(ctx context.Context, aut
 		e.pool.Release(w, true)
 		return out, nil
 	}
+	releaseLease, leased := e.stateful.AcquireLease(tableKey, w, key, resolvedVariant)
+	if !leased {
+		e.pool.Release(w, true)
+		return out, nil
+	}
+	out.releaseLease = releaseLease
 	stages.markPoolAcquired()
 	out.hit = true
 	out.worker = w

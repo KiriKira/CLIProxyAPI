@@ -11,6 +11,27 @@ func newStatefulTestWorker() *AntigravityAcpWorker {
 
 // TestStatefulTable_BindLookupTurnAdvance covers the happy path: bind turn 0,
 // look up, bind turn 1; LastTurn advances monotonically.
+func TestStatefulTable_ActiveLeaseDefersLRUEviction(t *testing.T) {
+	table := NewStatefulSessionTable(0, 1)
+	worker := newStatefulTestWorker()
+	table.Bind("logical-a", "session-a", "auth", "model", worker, 0)
+	release, ok := table.AcquireLease("logical-a", worker, "auth", "model")
+	if !ok {
+		t.Fatal("AcquireLease(logical-a) failed")
+	}
+	table.Bind("logical-b", "session-b", "auth", "model", worker, 0)
+	if got := table.Len(); got != 1 {
+		t.Fatalf("binding count while active lease = %d, want 1", got)
+	}
+	if _, ok := table.Lookup("logical-a", worker, "auth", "model"); !ok {
+		t.Fatal("active binding was evicted while leased")
+	}
+	release()
+	if got := table.Len(); got != 0 {
+		t.Fatalf("binding count after deferred eviction = %d, want 0", got)
+	}
+}
+
 func TestStatefulTable_BindLookupTurnAdvance(t *testing.T) {
 	tb := NewStatefulSessionTable(30*time.Minute, 8)
 	w := newStatefulTestWorker()
