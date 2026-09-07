@@ -1491,7 +1491,11 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 					now := time.Now()
 					stages.markSessionSetup(now, now, "stateful_reuse")
 				} else {
-					// Ambiguous history: release the lease, bootstrap.
+					// Ambiguous history: release both the worker and its
+					// binding lease before bootstrapping.
+					if acq.releaseLease != nil {
+						acq.releaseLease()
+					}
 					e.pool.Release(acq.worker, true)
 				}
 			}
@@ -1765,10 +1769,6 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 			promptPayload = acq.info.incrementalBody
 		}
 	}
-	if releaseDocumentLease != nil {
-		defer releaseDocumentLease()
-	}
-
 	if !documentMode && e.pool != nil {
 		authKey = e.authPoolKey(auth)
 		if signals.reuse && e.stateful != nil {
@@ -1788,13 +1788,15 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 					now := time.Now()
 					stages.markSessionSetup(now, now, "stateful_reuse")
 				} else {
+					// Ambiguous history: release both the worker and its
+					// binding lease before bootstrapping.
+					if acq.releaseLease != nil {
+						acq.releaseLease()
+					}
 					e.pool.Release(acq.worker, true)
 				}
 			}
 		}
-	}
-	if releaseStatefulLease != nil {
-		defer releaseStatefulLease()
 	}
 
 	if worker == nil && e.pool != nil {
@@ -1898,6 +1900,14 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 			}
 			close(chunkChan)
 			stages.logStageTimings(req.Model, true)
+		}()
+		defer func() {
+			if releaseDocumentLease != nil {
+				releaseDocumentLease()
+			}
+			if releaseStatefulLease != nil {
+				releaseStatefulLease()
+			}
 		}()
 
 		prompt := <-promptCh

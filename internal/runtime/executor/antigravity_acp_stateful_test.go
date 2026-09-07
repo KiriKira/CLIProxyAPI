@@ -83,6 +83,25 @@ func statefulRequest(t *testing.T, execer *AntigravityAcpExecutor, auth *cliprox
 	}
 }
 
+func statefulStreamRequest(t *testing.T, execer *AntigravityAcpExecutor, auth *cliproxyauth.Auth, opts cliproxyexecutor.Options, history string) {
+	t.Helper()
+	req := cliproxyexecutor.Request{
+		Model:   "gemini-3.8-flash",
+		Payload: []byte(history),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	stream, err := execer.ExecuteStream(ctx, auth, req, opts)
+	if err != nil {
+		t.Fatalf("ExecuteStream failed: %v", err)
+	}
+	for chunk := range stream.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error: %v", chunk.Err)
+		}
+	}
+}
+
 func readStatefulLog(t *testing.T, script, name string) string {
 	t.Helper()
 	raw, err := os.ReadFile(filepath.Join(filepath.Dir(script), name))
@@ -181,7 +200,35 @@ func TestStatefulReuse_TwoTurnHitSendsOnlyNewTurn(t *testing.T) {
 	}
 }
 
-// TestStatefulReuse_PostLeaseTurnRecheckRejectsConcurrentDuplicate verifies
+func TestStatefulReuse_StreamTwoTurnHitSendsOnlyNewTurn(t *testing.T) {
+	script := statefulLogAgent(t)
+	execer := NewAntigravityAcpExecutor(&internalconfig.Config{Antigravity: internalconfig.AntigravityConfig{PersistentProcess: boolPtr(true)}})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"binary_path": script,
+		"gemini_home": t.TempDir(),
+	}}
+
+	history1 := `{"messages":[{"role":"system","content":"You translate."},{"role":"user","content":"stream ONE"}]}`
+	statefulStreamRequest(t, execer, auth, statefulOpts("stream-session", 0), history1)
+	history2 := `{"messages":[{"role":"system","content":"You translate."},{"role":"user","content":"stream ONE"},{"role":"assistant","content":"ok one"},{"role":"user","content":"stream TWO SECRET-8"}]}`
+	statefulStreamRequest(t, execer, auth, statefulOpts("stream-session", 1), history2)
+
+	methods := readStatefulLog(t, script, "methods.log")
+	if got := strings.Count(methods, "session/new"); got != 1 {
+		t.Fatalf("stream turn 2 opened %d sessions; want exactly 1\nlog: %s", got, methods)
+	}
+	prompts := promptTexts(t, script)
+	if len(prompts) != 2 {
+		t.Fatalf("expected 2 stream prompt turns, got %d: %v", len(prompts), prompts)
+	}
+	if strings.Contains(prompts[1], "You translate") || strings.Contains(prompts[1], "stream ONE") {
+		t.Fatalf("stream turn 2 replayed history: %q", prompts[1])
+	}
+	if !strings.Contains(prompts[1], "stream TWO SECRET-8") {
+		t.Fatalf("stream turn 2 missing newest user batch: %q", prompts[1])
+	}
+}
+
 // the R4a race: a request may pass the pre-lease turn check, wait behind an
 // earlier lease, and observe that the binding already advanced. It must fall
 // back instead of appending the same incremental turn twice.
