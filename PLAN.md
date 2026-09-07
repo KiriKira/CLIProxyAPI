@@ -5,19 +5,19 @@
 1. Keep warm-path ACP TTFT low.
 2. Make ACP daemon/session/harness resource use **bounded over time**, including fully stateless traffic.
 3. Preserve ordinary OpenAI-compatible stateless behavior by default.
-4. Keep strict stateful conversation reuse for clients that can provide a stable logical session id, monotonic turn number, and full-history recovery source.
+4. Keep strict stateful conversation reuse for clients that provide a stable logical session id, monotonic turn number, and full-history recovery source.
 5. Add a separate **page/document-affinity** mode for segmented translation workloads such as Immersive Translate.
-6. Use an explicit header contract as the primary, maintainable way to opt into document affinity.
+6. Use an explicit header contract as the primary, maintainable opt-in to document affinity.
 7. Use one stable page/document identity for both YouTube subtitles and long articles; do not build separate video/article session systems.
-8. Prevent article burst concurrency, retries, and lifecycle caps from recreating unbounded sessions, goroutines, or metadata maps.
-9. Keep recovery and forward progress correct even on the intended low-memory `max-workers: 1` deployment.
+8. Prevent article burst concurrency, retries, lifecycle caps, LRU eviction, and worker recycling from recreating unbounded sessions, goroutines, stale bindings, or metadata maps.
+9. Preserve forward progress and real OS-resource bounds on the intended low-memory `max-workers: 1` deployment.
 
 Target behavior:
 
 ```text
 Immersive Translate request
   -> explicit X-ACP-* headers select document-affinity semantics
-  -> explicit machine-readable page title/id marker provides identity
+  -> machine-readable page/document marker provides identity
 
 first batch for document D
   -> create/consume one fresh ACP session
@@ -26,6 +26,7 @@ first batch for document D
 
 later batch for document D
   -> reacquire owning worker
+  -> revalidate binding after lease acquisition
   -> reuse same ACP session
   -> send only newest user translation batch
   -> no session/new
@@ -34,300 +35,304 @@ switch to document E
   -> bootstrap another bounded binding/session
 
 worker reaches hard session pressure
-  -> old worker becomes draining
+  -> worker becomes draining
+  -> existing bound sessions may continue while useful
   -> fresh-session demand MUST still make progress
   -> retire an idle draining worker when necessary
-  -> purge/rebootstrap its old bindings
-  -> terminate daemon process tree
-  -> spawn replacement
+  -> purge all of its bindings through one unified retirement path
+  -> physically terminate daemon + harness process tree
+  -> only then return hard process capacity / spawn replacement
 ```
 
 ---
 
-# 0. Review Gate for `feat/antigravity-session-lifecycle-step1`
+# 0. Current Review Gate — second review of implementation branch
 
-Reviewed branch head: `ee3b2605a9e93bb4f3a162751ec582cbcbf80cc5`.
-
-### Implementation status (updated after R1 fix)
-
-- **R1 — FIXED.** `forceRetireIdleDrainingLocked` in
-  `internal/runtime/executor/helps/antigravity_acp_pool.go` retires the least
-  recently used **idle draining** worker of the key (ignoring its bindings)
-  right before the fresh acquirer would join the wait queue; the retirement
-  removes the worker, returns its global slot, purges strict/document
-  bindings through the `SetWorkerRetiredHook` registered by the executor
-  (both binding tables), wakes same-key waiters, and closes the ACP client.
-  `Release` of a draining worker now wakes queued waiters so the escape
-  hatch runs promptly even when the cap was hit while a prompt was in
-  flight. Forced retirement never touches `inUse` workers. The cross-key
-  eviction and idle-expiry paths also purge bindings now. Tests:
-  `antigravity_acp_r1_test.go` (pool level: single-worker fresh progress,
-  hook purge, never-in-use, evicted-bound purge; executor level: both
-  binding tables emptied and lookups fail after forced retirement).
-- **R4 — FIXED.** Binding validation moved fully inside
-  `acquireDocumentSession` / `acquireStatefulSession` (see Step 2 below);
-  the prompt builder starts only after the hit/miss verdict is final, so no
-  incremental payload can leak into a fresh session and the captured
-  `promptPayload` is never mutated after the goroutine starts.
-- **R3 — FIXED.** YouTube notification-prefix normalization gated on the
-  ` - YouTube` tab-title suffix; ordinary `(number)` titles stay distinct
-  (see Step 4 below).
-- **R2 — FIXED.** Raw per-key mutex lanes replaced with context-aware,
-  reference-counted, bounded token-channel lanes (`AcquireLane`): ctx
-  cancellation while waiting, bounded waiter queue with retryable
-  `ErrDocumentLaneBusy`, lane GC on last reference, ABA-safe releases (see
-  Step 3 below).
-- R3 — FIXED (code side). R5/R6/R7 need the live VPS / real plugin probes;
-  order below is unchanged.
-
-The branch contains the right overall direction:
-
-- Unix ACP process-group ownership and TERM/KILL escalation;
-- per-worker session ledger and hard-cap plumbing;
-- worker draining state;
-- explicit document-affinity headers;
-- document binding table and same-worker reuse;
-- per-document serialization;
-- a 50-sequential-request test proving one document can reuse one ACP session.
-
-However, **do not treat Step 1-3 as complete yet**. The following review findings must be resolved before the live VPS soak test.
-
-## R1 — BLOCKER: draining bound worker can prevent all fresh-session progress
-
-Current worker recycling requires a draining worker to have no strict/document bindings:
+Reviewed branch head:
 
 ```text
-draining
-+ idle
-+ no refill/prepared session
-+ boundStrict == 0
-+ boundDocument == 0
-=> recyclable
+fb55bbe778c9b7916102a303d6a4b74aa4251e58
 ```
 
-That is safe for existing bindings but breaks the intended single-worker deployment:
+Commits reviewed since the previous review-plan commit `9450b2b28f1b2e88353c7e8f71df273ef3f7dd65`:
 
 ```text
-max-workers: 1
-max-sessions-per-worker: N
-
-worker reaches N
--> worker becomes draining
--> existing document D remains bound
--> user switches to new document E
--> E needs session/new
--> Acquire skips draining worker
--> per-auth worker slot is still occupied
--> replacement cannot spawn
--> request waits
+a696f488  R1  guarantee forward progress at draining session cap
+21152194  R4  finalize reuse binding before prompt build
+26beb1f8  R2  bound and cancel document lane waiters
+fb55bbe7  R3  gate YouTube title decoration normalization
 ```
 
-The binding TTL does not save this path reliably because binding expiry is currently lazy: if document D is never looked up again, its expired binding does not automatically disappear.
+## Status summary
+
+- **R1 core forward-progress escape hatch: implemented, but NOT complete.** The single-worker draining-worker deadlock has a targeted fix, but one worker-removal path still bypasses binding purge, and hard process capacity is currently returned before process-tree teardown finishes.
+- **R4 document full-vs-incremental prompt race: fixed.** Document hit/miss is now finalized before the prompt builder starts.
+- **R4 strict-stateful equivalent: partially fixed.** Worker/binding revalidation moved before prompt build, but monotonic turn order is not rechecked after waiting for the worker; concurrent duplicate turns can still append twice.
+- **R2 bounded/cancelable document lanes: core implementation is good.** Lane entries are reference-counted and garbage-collected, waiters are bounded and context-aware. HTTP-level retryable backpressure semantics still need to be made explicit/tested.
+- **R3 title-prefix gate: local normalization function is fixed, but real document-key stability is NOT fixed yet.** The dynamic raw title in the system prompt still enters the semantic fingerprint, so `(132)` -> `(133)` can still change the final key in the real Immersive Translate prompt shape.
+- **R5/R6/R7 live validation remains pending.** Real harness PGID/SID, direct `{{imt_title}}` probe, and semantic-key stability must still be checked before the long soak.
+
+Do **not** start the final YouTube soak yet. Continue implementation with the review items below.
+
+---
+
+## R1a — BLOCKER: unify every worker-removal path through retirement hooks
+
+The new `SetWorkerRetiredHook` correctly lets the executor purge strict/document bindings when workers are deliberately retired. However, every path that removes a worker from the pool must use that same retirement primitive.
+
+One remaining cross-key eviction path in `Release()` still effectively does:
+
+```text
+remove worker
+-> return global slot
+-> close client asynchronously
+```
+
+when another auth/key has waiters and the global cap is full. That path does not currently run the worker-retired hook before removal/close.
+
+This can leave binding-table entries pointing at a worker that has already disappeared from the pool/process layer.
 
 ### Required rule
 
-> A hard resource cap must never sacrifice fresh-request forward progress.
+> There must be one logical worker-retirement operation, and every non-dead removal path must go through it.
 
-When a request needs a new ACP session and all per-auth capacity is occupied only by **idle draining workers**, the pool must be allowed to retire an idle draining victim even when it still owns strict/document bindings.
+At minimum cover:
 
-Retirement sequence:
+- forced idle-draining retirement for same-key fresh progress;
+- cross-key oldest-idle eviction;
+- `Release()` cross-key waiter eviction;
+- idle-timeout retirement;
+- pool shutdown where binding tables are still relevant;
+- future administrative/limit eviction paths.
 
-1. never retire an `inUse` worker;
-2. remove the idle draining worker from the pool;
-3. purge/invalidate strict and document bindings owned by it;
-4. close its ACP client/process group so all daemon sessions/harnesses disappear;
-5. return the worker/global slot;
-6. wake/retry the fresh acquirer and spawn a replacement.
+Preferred structure:
 
-Recovery semantics are already compatible with this:
+```text
+select victim under pool lock
+-> detach from routing
+-> record retirement reason
+-> notify/purge owner bindings exactly once
+-> close/wait process tree outside pool lock
+-> finish capacity handoff/wake waiters
+```
 
-- strict stateful client -> next turn bootstraps from full history;
-- document client -> next batch bootstraps from the current request and loses only opportunistic prior-document context.
+Avoid copying slightly different `removeWorkerLocked + globalSlotRelease + closeClientAsync` sequences across call sites.
 
 ### Required tests
 
-- `maxWorkers=1`, `maxSessionsPerWorker=1`: create + bind session A, release worker, then request a fresh session B; B must receive a replacement worker promptly rather than waiting forever.
-- forced retirement purges strict bindings; next strict request bootstraps from full history.
-- forced retirement purges document bindings; next document request bootstraps from its current full request.
-- never force-retire a worker while a prompt is `inUse`.
-
-This is the first fix before continuing.
+- Create a bound document session on worker A, fill global capacity, queue another auth/key, then release A so the `Release()` cross-key eviction path fires; document binding must be purged immediately.
+- Same test for strict binding.
+- Every worker-removal reason invokes the retired hook exactly once.
+- No removal hook is invoked while holding locks in a way that can deadlock with binding-table -> worker accounting transitions.
 
 ---
 
-## R2 — BLOCKER before article testing: document lane map is unbounded and waits ignore context
+## R1b — P0 resource invariant: do not return hard process capacity before process-tree cleanup completes
 
-Current `DocumentSessionTable` stores:
+Current retirement removes the worker and returns the logical worker/global slot before `Client.Close()` has physically finished process-group cleanup. `Client.Close()` is intentionally non-blocking and its reaper may still spend the EOF grace period plus TERM/KILL escalation time reclaiming descendants.
 
-```go
-lanes map[string]*sync.Mutex
+On a 1 GiB VPS this permits a transient state such as:
+
+```text
+old daemon + old harnesses still alive
++
+replacement daemon + new harness/session starts
 ```
 
-A lane is created for every unique document key and never deleted. The binding table is TTL/LRU bounded, but the lane table is not.
+That violates the strongest interpretation of the PLAN's resource bound and can create the exact short-lived RAM/swap spike that the lifecycle work is meant to prevent.
 
-The raw `Mutex.Lock()` also means:
+### Required decision/invariant
 
-- a request canceled while waiting for the same document cannot stop waiting;
-- waiter count is unbounded;
-- a large article burst can accumulate arbitrarily many waiting goroutines;
-- the planned 429/503 backpressure does not yet exist.
+For configured **hard** worker/process limits, distinguish:
 
-### Required replacement
-
-Use a context-aware keyed lane/gate with reference-counted lifecycle, conceptually:
-
-```go
-type documentLane struct {
-    token   chan struct{} // capacity 1 for one-lane mode
-    waiters int
-    refs    int
-}
+```text
+routing slot        = worker may receive requests
+process capacity    = daemon/process tree is physically alive
 ```
 
-Exact implementation may differ, but it must provide:
+A retiring worker may leave routing immediately, but its hard process-capacity token should not become reusable until its owned process tree is confirmed gone.
 
-- one holder per document lane in v1;
-- `ctx.Done()` cancels a waiting request;
-- configurable/bounded waiter count;
-- queue overflow returns a retryable error instead of creating another session;
-- lane entry is removed when it has no holder/waiters/references;
-- no ABA deletion race if a new lane for the same key is created while an old release runs.
+Possible implementation:
+
+- add a `treeDone`/`CloseAndWait(ctx)` style completion signal to the ACP client that closes only after EOF/TERM/KILL reaping is complete;
+- keep a `retiring` process count/token in the pool;
+- wake fresh acquirers after physical cleanup returns capacity;
+- never hold pool locks while waiting for process exit.
+
+If the project deliberately chooses to allow one bounded overlap during replacement, document and test that explicit bound instead of calling the process limit strict.
 
 ### Required tests
 
-- 1000 unique document keys acquired/released do not leave 1000 permanent lane entries.
-- canceled waiter exits promptly without waiting for current generation completion.
-- queue limit is enforced.
-- 10 simultaneous cold requests for one document still perform exactly one bootstrap/session-new in one-lane mode.
-
-Do this before a long-article burst test.
+- `maxWorkers=1`: forced retirement cannot spawn replacement while fake old child tree is still deliberately alive inside the cleanup grace period, if strict mode is chosen.
+- After cleanup completion replacement starts promptly.
+- Repeated retire/spawn cycles never produce more concurrently live owned ACP process trees than the documented bound.
 
 ---
 
-## R3 — Correctness: YouTube notification-prefix normalization is currently applied globally
+## R4a — Correctness: strict stateful turn order must be rechecked after worker acquisition
 
-Current normalization strips:
-
-```regex
-^\(\d+\)\s*
-```
-
-from every document title.
-
-That is too broad. It can incorrectly merge legitimate documents such as:
+`acquireStatefulSession()` checks:
 
 ```text
-(1) Introduction
-(2) Introduction
+incoming turn == LastTurn + 1
 ```
 
-The PLAN requirement remains:
+before `AcquireSpecific()` waits for the owning worker. After the wait, it performs an authoritative binding lookup, but does not re-check the turn number against the binding's now-current `LastTurn`.
 
-> Core document normalization is generic and conservative; site-specific decoration removal is gated by known site/profile evidence.
-
-For the personal YouTube case, a simple initial gate is sufficient:
+Race example:
 
 ```text
-only strip ^\(\d+\)\s* when the title is recognizably a YouTube tab title,
-for example when it ends with " - YouTube"
+binding LastTurn = 4
+request A turn=5 -> precheck passes -> acquires worker
+request B turn=5 -> precheck passes -> waits for same worker
+A succeeds -> binding LastTurn becomes 5
+B acquires worker -> worker/auth/model lookup still passes
+B appends duplicate turn 5
 ```
-
-A future real URL/document id should replace this heuristic.
-
-### Required tests
-
-- `(132) Foo - YouTube` and `(133) Foo - YouTube` normalize to the same identity.
-- `(1) Introduction` and `(2) Introduction` remain distinct.
-- `(2024) Annual Report` remains unchanged.
-
----
-
-## R4 — Correctness/data-race risk: late binding invalidation can bootstrap with the incremental payload
-
-Both non-stream and stream paths currently launch the prompt-builder goroutine using the presumed hit payload before the final binding validation.
-
-Conceptually:
-
-```text
-binding appears to hit
--> prompt goroutine starts building incremental newest-user payload
--> second Lookup says binding is no longer valid
--> code switches statefulHit=false and intends to bootstrap
--> fresh session is opened
-```
-
-Changing `promptPayload` after the goroutine has started does not safely rebuild the prompt. Depending on scheduling, the fresh session can receive only the incremental turn instead of the full bootstrap request; the unsynchronized variable access is also a race-prone pattern.
-
-This affects document mode and the analogous strict-stateful late-invalidation path.
 
 ### Required fix
 
-Choose one:
+After `AcquireSpecific()` succeeds and the authoritative binding is looked up again:
 
-1. finish all binding validation before starting the prompt builder; **preferred if it does not hurt useful overlap**, or
-2. if late validation fails, explicitly drain/clean the incremental build and start a new full-payload build before prompting the fresh session.
+```text
+if incomingTurn != binding.LastTurn + 1:
+    release worker
+    invalidate/fallback according to strict-stateful recovery semantics
+    do NOT send incremental turn
+```
 
-Never rely on mutating a captured `promptPayload` variable after a goroutine has started.
+The post-lease check is the authoritative sequence check. The earlier check remains useful as a fast rejection but cannot be the only one.
 
 ### Required tests
 
-Create deterministic hooks/fakes that invalidate a binding between initial lookup/acquisition and final validation, then verify:
-
-- a fresh session is created;
-- bootstrap prompt contains full system/developer/history context;
-- only a verified live hit receives the incremental newest-user payload;
-- stream and non-stream paths behave identically;
-- race test covers this transition.
+- Two concurrent requests with the same next turn: exactly one may continue incrementally; the second must not append the same turn.
+- Concurrent turn N and N+1 serialize and produce the intended result under the chosen recovery semantics.
+- Stream and non-stream strict paths behave consistently.
 
 ---
 
-## R5 — Validation gate: process-group tests do not yet prove the real harness stays in the daemon group
+## R2a — Backpressure must surface as an explicit retryable HTTP result
 
-The fake Linux test is useful and should stay. It proves cleanup when daemon children inherit the ACP process group.
+`AcquireLane()` now has bounded waiters and returns `ErrDocumentLaneBusy` on overflow. This is the right internal primitive.
 
-It does **not** prove that the real `localharness_external` never calls `setsid`/`setpgid` or otherwise detaches itself.
-
-Before declaring process-tree cleanup complete, run one live validation on the VPS:
+Do not leave the public behavior to generic error mapping. At the executor/handler boundary, map lane saturation to an explicit retryable response, for example:
 
 ```text
-PID  PPID  PGID  SID  COMMAND
+429 Too Many Requests
 ```
 
-for:
+or deliberately chosen:
 
-- CLIProxyAPI;
-- `agy_acp_server.par`;
-- several `localharness_external` children.
+```text
+503 Service Unavailable
+```
 
-Then force one controlled worker recycle and confirm all harness PIDs disappear and swap is reclaimed/stabilizes.
+The selected status should be stable/documented so Immersive Translate retries rather than treating queue pressure as a permanent translation failure.
 
-If real harnesses detach from the process group, process-group kill is insufficient. Linux fallback options then include:
+Also make cancellation deterministic: if context is already canceled when lane ownership becomes available, do not unnecessarily run the prompt just because Go `select` happened to choose the token branch.
 
-- capture/kill descendants before the parent disappears;
-- cgroup-based worker ownership/cleanup;
-- another verified process-tree containment mechanism.
+### Required tests
 
-Do not redesign this prematurely; first inspect the real PGID/SID behavior.
+- lane overflow produces the chosen HTTP status, not generic 500;
+- canceled waiter never reaches `session/new`/`session/prompt`;
+- the historical-key GC test uses genuinely distinct document keys, not one repeated key.
 
 ---
 
-## R6 — Identity robustness: prefer direct `{{imt_title}}` marker if one-request verification succeeds
+## R3a / R7 — BLOCKER before soak: remove dynamic document context from the semantic fingerprint
 
-Immersive Translate's current prompt documentation defines `imt_title` as a system-injected special variable, and default `title_prompt` itself expands from it.
+The local title normalizer now correctly gates YouTube notification-prefix removal to titles ending in ` - YouTube`.
 
-The current implementation parses literal `Title:` text from the expanded `title_prompt`. That is unnecessarily coupled to formatting/localization:
+However, the final document key is approximately:
 
 ```text
-Title: "..."
-Title: 《...》
-标题：《...》
+hash(
+  auth
+  + client
+  + normalized identity
+  + model/source format
+  + documentSemanticFingerprint(cleaned request)
+)
 ```
 
-It also interacts badly with the current YouTube-prefix stripper when the title is wrapped in `《》`.
+`documentSemanticFingerprint()` retains system/developer messages. In the real Immersive Translate integration, `{{title_prompt}}` normally lives in the **system prompt**, so the raw title text remains inside the semantic fingerprint even after the separate identity has been normalized.
 
-### Preferred user configuration after a one-request probe
+Therefore these two requests can still produce different final keys:
 
-First verify that this expands correctly in the user's active Immersive Translate configuration:
+```text
+Title: "(132) Example video - YouTube"
+Title: "(133) Example video - YouTube"
+```
+
+because the normalized identity matches but the system-message semantic hash changes.
+
+The current R3 unit test does not catch this because its marker/title is placed in a user message, and user messages are excluded from the semantic projection.
+
+### Required architectural rule
+
+> Document identity and dynamic document context must not be hashed again as if they were stable translation configuration.
+
+Before hashing semantic configuration, replace/remove the machine identity block and other verified volatile document-derived context from the projection.
+
+Conceptually split:
+
+```text
+DocumentKey = hash(
+  auth/client namespace
+  + normalized document identity
+  + model/source-target language
+  + stable translation semantics
+)
+
+stable translation semantics != full system prompt bytes
+```
+
+Likely stable semantic material includes:
+
+- fixed translation instructions;
+- chosen source/target language where available;
+- model/effort variant;
+- user style configuration when it actually changes translation semantics.
+
+Potentially volatile document material includes:
+
+- page title / notification count;
+- page summary/theme generated from current page;
+- extracted terms if they are generated/refined dynamically across batches.
+
+Do not blindly exclude summary/terms yet: first capture safe component hashes over 20-50 real batches and confirm whether they vary. But the title machine block is already known document identity and should not be duplicated into the semantic hash.
+
+### Required tests
+
+Use a **real-shaped system prompt fixture**:
+
+```text
+SYSTEM:
+  stable translation instructions
+  [[CLIPROXY_ACP_TITLE_PROMPT:v1]]
+  Document Metadata:
+  Title: "(132) Example video - YouTube"
+  [[/CLIPROXY_ACP_TITLE_PROMPT]]
+  summary/terms/style...
+
+USER:
+  current p0..p7 translation batch
+```
+
+Then change only `(132)` -> `(133)` and assert the final document key stays identical.
+
+Also assert:
+
+- changing a genuinely stable translation instruction changes key;
+- changing model/language changes key;
+- ordinary `(1) Introduction` and `(2) Introduction` remain different identities;
+- any observed summary/terms variation follows the policy chosen after measurement.
+
+---
+
+## R6 — Identity robustness: prefer direct `{{imt_title}}` marker if live probe succeeds
+
+Before the live soak, test one real Immersive Translate request with:
 
 ```text
 [[CLIPROXY_ACP_DOCUMENT_TITLE:v1]]
@@ -337,93 +342,93 @@ First verify that this expands correctly in the user's active Immersive Translat
 {{imt_style_guide}}
 ```
 
-If the captured request contains the real title inside this marker, make this the primary identity path:
+If `{{imt_title}}` expands to the real current page title in the user's active version/configuration:
 
-- proxy strips the machine marker block entirely before ACP;
-- `title_prompt` remains untouched and model-visible;
-- identity parsing no longer depends on English `Title:` formatting;
-- title normalization operates directly on the raw page title.
+- use this marker as the primary document identity path;
+- strip the entire machine identity block before forwarding to ACP;
+- keep ordinary `title_prompt` untouched/model-visible;
+- stop depending on localized `Title:` parsing for the primary path.
 
-Keep the existing wrapped-`title_prompt` parser as a compatibility fallback if direct `imt_title` expansion fails in the actual installed version/config.
-
-Do not block R1-R5 on this probe; perform it before the live Immersive Translate soak test.
-
----
-
-## R7 — Measure semantic-key stability before relying on full system-prompt fingerprinting
-
-The current document semantic fingerprint retains system/developer messages. In Immersive Translate this can include:
-
-- title context;
-- page summary (`summary_prompt` / `imt_theme`);
-- extracted terminology (`terms_prompt` / `imt_terms`);
-- style guide and static translation instructions.
-
-If summary/terms are populated or changed between batches, the same page can generate a new document key and unexpectedly create another ACP session.
-
-### Required measurement
-
-For one YouTube page and one long article, log only safe hashes/diagnostics for 20-50 batches and answer:
-
-- does the semantic fingerprint remain stable?
-- if it changes, which semantic component changed?
-- does the change happen only once during initial context enrichment or repeatedly?
-
-If dynamic page-derived context causes churn, split the key conceptually into:
+If it does not expand reliably, retain wrapped `{{title_prompt}}` as the compatibility path:
 
 ```text
-stable translation semantics
-+ document identity
+[[CLIPROXY_ACP_TITLE_PROMPT:v1]]
+{{title_prompt}}
+[[/CLIPROXY_ACP_TITLE_PROMPT]]
 ```
 
-and exclude volatile document-derived summary/terms from the affinity key, or define a deliberate bounded rollover policy for those changes.
-
-Do not guess the final exclusion set before observing real requests.
+Either way, R3a's semantic projection rule still applies: machine routing identity must not destabilize the semantic hash.
 
 ---
 
-## R8 — Documentation/test fixture alignment
+## R5 — Validation gate: verify the real harness remains in the owned process group
 
-The current document-affinity documentation/test examples place the title marker in a user prompt, while the intended Immersive Translate configuration normally carries title context in the system prompt.
+The fake Linux process-tree tests prove cleanup when descendants inherit the ACP daemon process group. They do not prove the real `localharness_external` never calls `setsid()` / `setpgid()`.
 
-The recursive parser happens to accept both, but acceptance tests should match the real integration shape.
-
-Add a captured-style fixture:
+On the VPS inspect:
 
 ```text
-SYSTEM:
-  translation instructions
-  machine title marker
-  title/summary/terms/style context
-
-USER:
-  p0..p7 / YAML / current translation batch
+PID  PPID  PGID  SID  COMMAND
 ```
 
-Assert that a document hit sends only the user batch and does not replay the system title/context.
+for CLIProxyAPI, `agy_acp_server.par`, and several `localharness_external` children.
+
+Then force a controlled worker retirement and verify:
+
+- every harness PID owned by that worker disappears;
+- no detached child remains;
+- repeated retire/spawn cycles do not accumulate old harnesses;
+- swap/RSS returns toward a stable bounded range.
+
+If harnesses detach, process-group kill is not sufficient; evaluate cgroup/process-tree containment only after confirming that fact.
 
 ---
 
-# 1. Current Evidence and Design Consequences
+## R9 — Lifecycle consistency: do not LRU/TTL-abandon a binding while its session is actively leased
 
-## 1.1 Production resource-growth result
+The strict/document binding tables may evict an LRU binding and call `worker.AbandonSession(sessionID)`. A long-running request can still be actively using that bound session while other documents/sessions push the table over its max size.
 
-The 2026-09-07 Immersive Translate YouTube test showed:
+Possible failure sequence:
 
-- one request roughly every 25-30 seconds;
-- almost every stateless request consumes or creates one new ACP session;
-- observed ACP sessions correspond closely to new `localharness_external` children;
-- old harnesses did not disappear while the daemon remained alive;
-- each old harness retained roughly 40-63 MiB swap in the tested 1 GiB RAM / 2 GiB swap VPS;
-- roughly 37 harnesses consumed about 1.9 GiB swap and caused swap thrashing, high load, TTFT degradation, and 499 timeouts;
-- `prepared-sessions: 1` bounds only the ready cache, not historically created daemon sessions/harnesses;
-- `prepared-sessions: 0` removes refill-created sessions but still leaves one `session/new` per ordinary stateless request.
+```text
+request D looks up binding -> worker/session leased -> D prompt running
+many other bindings are inserted
+-> D becomes LRU and is evicted
+-> worker ledger deletes D session as abandoned
+D prompt later succeeds
+-> executor re-binds same session ID
+-> worker.BindSession may not restore accounting because ledger entry was deleted
+```
 
-Therefore lifecycle bounding remains mandatory even after document reuse works.
+This can leave binding-table state and worker session ledger inconsistent, and a draining worker could become recyclable while a logically live binding exists.
 
-## 1.2 Maintainability decision
+### Required rule
 
-The primary supported document integration uses explicit protocol headers:
+Binding eviction/expiry must distinguish **idle binding** from **actively leased binding**.
+
+Options:
+
+- pin/refcount a binding while its worker/session is leased;
+- defer eviction until the active turn releases;
+- mark eviction pending and finalize it after lease completion.
+
+Do not solve this by silently recreating a ledger record for an unknown provider-side session unless its lifecycle is provably owned and counted.
+
+### Required tests
+
+- force a very small binding-table max, keep one binding actively leased, insert enough others to trigger LRU pressure; active binding must not disappear/account as abandoned until release.
+- after deferred eviction, binding and worker ledger transition exactly once.
+- repeat for strict and document tables or factor a shared invariant.
+
+This is less likely in the personal one-video workload than R1/R3, but it should be fixed before calling the general lifecycle implementation complete.
+
+---
+
+# 1. Current Architecture Decisions
+
+## 1.1 Explicit document protocol
+
+Primary request contract:
 
 ```http
 X-ACP-Session-Reuse: 1
@@ -433,6 +438,12 @@ X-ACP-Client: immersive-translate
 
 `X-ACP-Session-Scope: document` defines semantics. `X-ACP-Client` is a profile/logging namespace, not the semantic switch.
 
+Optional stronger identity:
+
+```http
+X-ACP-Document-ID: <stable page/video/document id>
+```
+
 Activation priority:
 
 ```text
@@ -441,25 +452,21 @@ Activation priority:
 3. ordinary stateless behavior
 ```
 
-Do not hard-wire the generic document mechanism to one browser-extension Origin.
+Do not hard-wire generic document affinity to one extension Origin.
 
----
+## 1.2 Strict stateful conversation
 
-# 2. P0 — Bound ACP Daemon / Session / Harness Lifecycle
+Existing contract:
 
-## 2.1 Process ownership and cleanup
+```http
+X-Session-ID: <stable logical conversation id>
+X-ACP-Session-Reuse: 1
+X-ACP-Session-Turn: <monotonic turn index>
+```
 
-Linux target:
+Strict mode has reconstructable full-history recovery and monotonic turn semantics. Document mode does not; do not merge their validation rules even if they share worker/session helpers.
 
-1. start the ACP daemon in a dedicated process group;
-2. close stdin/request graceful exit first;
-3. after grace expiry send TERM to the process group;
-4. escalate to process-group KILL;
-5. prove the real harness remains inside the owned group or add stronger containment.
-
-The current branch implements the first four items and fake child-process tests. R5 is the remaining live validation gate.
-
-## 2.2 Per-worker session ledger
+## 1.3 Lifecycle accounting
 
 Track every successful `session/new` exactly once:
 
@@ -473,13 +480,9 @@ type WorkerSessionStats struct {
 }
 ```
 
-A session becomes abandoned when the daemon remains alive but the proxy no longer has a reusable binding/path to it.
+A session becomes abandoned only when the daemon remains alive but the proxy no longer has a valid reusable path to it. Prepared -> leased -> bound transitions do not double-count creation.
 
-Prepared -> leased -> bound transitions must not double-count creation.
-
-## 2.3 Hard budgets and draining
-
-Configuration:
+Hard budgets:
 
 ```yaml
 antigravity:
@@ -487,87 +490,24 @@ antigravity:
   max-abandoned-sessions-per-worker: 0
 ```
 
-For the low-memory VPS, first validate small values such as 4-8 rather than selecting a large default.
-
-A draining worker:
-
-- never creates/refills another session;
-- may serve existing bindings while no fresh session is needed;
-- is excluded from ordinary fresh traffic;
-- **may be forcibly retired while idle when fresh demand otherwise cannot make progress** (R1);
-- is never forcibly retired while `inUse`.
-
-This gives the intended bounded sawtooth:
-
-```text
-spawn
--> create <= budget sessions
--> drain
--> retire/purge bindings when replacement is required
--> kill process tree
--> spawn replacement
-```
+For the low-memory VPS, validate small values such as 4-8 first.
 
 ---
 
-# 3. Reuse Protocols
+# 2. Document Identity and Immersive Translate Configuration
 
-## 3.1 Strict stateful conversation
-
-Existing contract:
-
-```http
-X-Session-ID: <stable logical conversation id>
-X-ACP-Session-Reuse: 1
-X-ACP-Session-Turn: <monotonic turn index>
-```
-
-A hit reuses the owning worker/session and sends only the newest turn. A miss/retired worker bootstraps from full history.
-
-## 3.2 Document affinity
-
-Primary contract:
-
-```http
-X-ACP-Session-Reuse: 1
-X-ACP-Session-Scope: document
-X-ACP-Client: immersive-translate
-```
-
-Optional stronger identity:
-
-```http
-X-ACP-Document-ID: <real stable page/video/document id>
-```
-
-Semantics:
-
-- no client turn number is required;
-- first request sends full current translation context and binds only after success;
-- healthy hit sends only the newest user translation batch;
-- binding loss starts a new session from the current request;
-- previous document context is opportunistic, not exactly recoverable.
-
----
-
-# 4. Document Identity and Immersive Translate Configuration
-
-## 4.1 Identity preference order
-
-Use the strongest available identity:
+## 2.1 Identity preference order
 
 ```text
-1. X-ACP-Document-ID when a real stable page/document id exists
+1. X-ACP-Document-ID when a true stable id exists
 2. direct machine marker containing {{imt_title}} after live verification
-3. wrapped {{title_prompt}} compatibility parser
-4. unmarked Document Metadata/Title parsing only for explicit document mode during migration
+3. wrapped {{title_prompt}} parser
+4. unmarked Document Metadata/Title parsing only as migration compatibility inside explicit document mode
 ```
 
-A raw title is namespaced with auth/client/model/source-format and the chosen stable semantic fingerprint before hashing.
+## 2.2 User-side headers
 
-## 4.2 Recommended Immersive Translate headers
-
-Configure the active service's `headerConfigs` with:
+Configure Immersive Translate `headerConfigs` for the active translation service:
 
 ```text
 X-ACP-Session-Reuse: 1
@@ -575,11 +515,7 @@ X-ACP-Session-Scope: document
 X-ACP-Client: immersive-translate
 ```
 
-Inspect the user's actual service entry when applying this; do not guess its config key.
-
-## 4.3 Preferred prompt after direct-variable probe
-
-Try:
+## 2.3 Preferred prompt if direct variable probe succeeds
 
 ```text
 [[CLIPROXY_ACP_DOCUMENT_TITLE:v1]]
@@ -589,13 +525,7 @@ Try:
 {{imt_style_guide}}
 ```
 
-If the request shows the real page title inside the marker, use this permanently.
-
-The proxy removes only the machine identity block; normal `title_prompt`, summary, terms, and style remain model-visible.
-
-## 4.4 Compatibility prompt if direct `imt_title` does not expand
-
-Use:
+## 2.4 Fallback prompt
 
 ```text
 [[CLIPROXY_ACP_TITLE_PROMPT:v1]]
@@ -605,37 +535,41 @@ Use:
 {{imt_style_guide}}
 ```
 
-The proxy extracts the title from the wrapped expanded block and removes only marker delimiters.
+The proxy removes machine routing delimiters/identity metadata as designed, while keeping normal human/model context visible.
 
-Parsing must handle the actually observed/default quoting/localization forms, including `《...》`; do not assume only `Title: "..."`.
+## 2.5 Conservative title normalization
 
-## 4.5 Conservative normalization
+Core normalization only trims/collapses clearly irrelevant whitespace.
 
-Core normalization:
+For known YouTube tab titles ending in:
 
-- trim surrounding whitespace;
-- collapse clearly irrelevant whitespace only;
-- no global site-specific prefix stripping.
+```text
+ - YouTube
+```
 
-YouTube notification-prefix normalization is gated to a known YouTube title/profile, e.g. title ending in ` - YouTube`.
+it may remove a leading volatile notification counter:
 
-Do not merge ordinary titles beginning with `(number)`.
+```regex
+^\(\d+\)\s*
+```
+
+Never apply that rewrite globally.
 
 ---
 
-# 5. Document Session Reuse
+# 3. Document Reuse Semantics
 
-## 5.1 Bootstrap
+## 3.1 Bootstrap
 
-For a new document:
+For a new document key:
 
 ```text
 full stable SYSTEM/developer translation instructions
-+ title/summary/terms/style context available in that request
-+ current USER batch
++ current document context available in that request
++ current USER translation batch
 ```
 
-Create/consume one fresh session and bind only after `session/prompt` succeeds.
+Create/consume one fresh ACP session and bind only after `session/prompt` succeeds.
 
 Log:
 
@@ -643,14 +577,16 @@ Log:
 session_mode=document_bootstrap
 ```
 
-## 5.2 Hit
+## 3.2 Hit
 
-For a live matching binding:
+For a live binding:
 
+- serialize on the document lane;
 - reacquire the same worker;
-- no `session/new`;
-- do not replay system/title/summary/terms context;
-- send only the newest user translation batch.
+- authoritatively revalidate binding after lease acquisition;
+- do not call `session/new`;
+- send only the newest user translation batch;
+- do not replay system/title/summary/terms context.
 
 Log:
 
@@ -658,31 +594,28 @@ Log:
 session_mode=document_reuse
 ```
 
-The late-binding transition must obey R4: only a verified hit may use the incremental payload.
+If binding/worker is gone, bootstrap from the current full document request. Exact previous document context reconstruction is not promised.
 
 ---
 
-# 6. Concurrency and Backpressure
+# 4. Concurrency, Backpressure, and Retry
 
-## 6.1 One-lane bootstrap singleflight
+## 4.1 One-lane default
 
-In default one-lane mode, concurrent cold requests for one document must produce one bootstrap session, not N sessions.
+Concurrent cold requests for one document must singleflight into one bootstrap session in one-lane mode.
 
-## 6.2 Context-aware bounded lane
+Production lane requirements:
 
-Replace permanent raw mutex lanes per R2.
+- one holder per document lane;
+- context-aware wait;
+- bounded waiters;
+- explicit retryable overflow result;
+- lane entry garbage-collected after final holder/waiter/reference leaves;
+- no ABA release race.
 
-Required behavior:
+## 4.2 Optional multi-lane
 
-- serialized prompts per ACP document session;
-- context cancellation while waiting;
-- bounded waiter count;
-- retryable backpressure on overflow;
-- automatic lane metadata cleanup.
-
-## 6.3 Optional bounded multi-lane mode
-
-Do not implement until one-lane measurements show it is necessary.
+Do not implement until one-lane live measurements prove necessary.
 
 Possible later config:
 
@@ -691,15 +624,11 @@ antigravity:
   document-session-max-lanes: 1
 ```
 
-If raised above 1, every lane is a real ACP session and counts against the worker session budget. Never create an unbounded overflow lane.
+Every extra lane is a real ACP session and consumes the worker session budget. Never create an unbounded overflow lane.
 
----
+## 4.3 Duplicate/retry protection
 
-# 7. Duplicate / Retry Protection
-
-A browser timeout can cause the same translation batch to be retried after ACP has already committed it to the document conversation.
-
-Before the timeout/retry soak test, add a bounded short-lived fingerprint/response cache:
+Before production timeout/retry testing, add a bounded recent request fingerprint/response cache:
 
 ```text
 document key
@@ -709,20 +638,16 @@ document key
 
 Desired behavior:
 
-- identical concurrent work coalesces where practical;
-- recently completed retry returns cached result instead of appending the same turn again;
-- cache count and TTL are bounded;
+- concurrent identical requests coalesce where practical;
+- recently completed retry returns cached result rather than appending same batch again;
+- cache size/TTL are bounded;
 - no cross-document dedupe.
-
-This is not required to fix R1-R5 but should precede production timeout/retry testing.
 
 ---
 
-# 8. Binding Lifetime and Very Long Documents
+# 5. Very Long Documents
 
-A single document session can itself grow too much in context.
-
-Track at least:
+A document session can eventually accumulate excessive context. Track at least:
 
 ```go
 type DocumentBindingStats struct {
@@ -734,7 +659,7 @@ type DocumentBindingStats struct {
 }
 ```
 
-Evaluate after the basic soak tests:
+Evaluate after the basic soak:
 
 ```yaml
 antigravity:
@@ -744,195 +669,127 @@ antigravity:
   max-document-sessions: 0
 ```
 
-Rollover makes the old binding/session abandoned, bootstraps the current request, and remains bounded by worker lifecycle caps.
-
-Do not add automatic summarization/carry-forward in v1.
+Rollover abandons the old binding/session, bootstraps the current request, and remains bounded by worker lifecycle caps. Do not add automatic summary carry-forward in v1.
 
 ---
 
-# 9. Cancellation and Failure Semantics
+# 6. Failure Semantics
 
-- canceled before prompt dispatch -> keep existing binding;
-- canceled/failed after prompt dispatch with ambiguous provider mutation -> invalidate binding/session;
+- canceled before prompt dispatch -> keep an existing binding;
+- canceled/failed after dispatch with ambiguous provider mutation -> invalidate binding/session;
 - worker/transport death -> purge every strict/document binding on that worker;
-- downstream formatting failure after a known-successful ACP prompt -> keep provider binding when safe;
-- completed-but-lost duplicate -> recover from bounded response cache when available;
-- forced idle draining-worker retirement -> purge bindings before/with worker removal and let clients bootstrap.
+- forced idle draining-worker retirement -> purge owned bindings and let clients bootstrap;
+- downstream formatting failure after a known-successful ACP prompt -> keep binding when provider state is known good;
+- completed-but-lost retry -> recover from bounded response cache when available.
 
 ---
 
-# 10. Tests and Acceptance Criteria
+# 7. Required Tests / Acceptance
 
-## 10.1 Lifecycle / forward progress
+## 7.1 Lifecycle
 
-- stateless loop never exceeds configured session pressure for a worker;
+- stateless loop remains bounded by configured worker session pressure;
 - prepared refill cannot cross cap;
-- prepared/bound session transitions do not double-count;
-- abandoned cap drains/recycles correctly;
-- R1 single-worker bound-session scenario returns a replacement rather than hanging;
-- forced retirement never kills an in-use prompt;
-- stale strict/document binding after forced retirement bootstraps correctly.
+- prepared/bound transitions do not double-count;
+- same-key single-worker cap scenario always makes forward progress;
+- all cross-key/same-key retirement paths purge bindings through one hook;
+- hard process capacity is not silently returned while old owned process tree still lives, unless a documented bounded-overlap policy is chosen;
+- forced retirement never kills an `inUse` prompt;
+- active binding cannot be LRU-abandoned while leased.
 
-## 10.2 Real process containment
+## 7.2 Strict stateful
 
-- fake child tests remain green;
-- inspect real `agy_acp_server.par` + `localharness_external` PGID/SID;
-- controlled worker recycle removes all real harness PIDs;
-- repeat recycle several times and verify no orphan accumulation.
+- post-lease authoritative turn recheck prevents concurrent duplicate next-turn append;
+- late invalidation bootstraps full history;
+- stream/non-stream behavior agrees.
 
-## 10.3 Document identity
+## 7.3 Document identity
 
-- explicit document headers activate document mode;
-- missing headers remain stateless;
-- direct `imt_title` marker works if supported by live configuration;
-- fallback `title_prompt` parser accepts actual default/localized quoting;
-- marker metadata is not forwarded when specified for stripping;
-- YouTube notification counters normalize only for YouTube;
-- legitimate `(number)` article titles stay distinct.
+- explicit headers activate document mode; missing headers stay stateless;
+- direct `imt_title` marker works if supported by the live plugin configuration;
+- fallback parser handles observed quoting/localization;
+- real-shaped system-title fixture `(132)` -> `(133)` yields same key for YouTube;
+- ordinary numbered titles remain distinct;
+- changing stable translation semantics/model/language changes key.
 
-## 10.4 Document reuse
-
-- first request -> one bootstrap session;
-- 50 sequential same-document requests -> one `session/new` before intentional rollover;
-- real-shaped system-marker + user-batch fixture hits reuse correctly;
-- different document -> different binding;
-- model/config incompatibility does not cross-reuse;
-- R4 late invalidation always rebuilds full bootstrap prompt in stream and non-stream paths.
-
-## 10.5 Concurrency
+## 7.4 Document concurrency
 
 - 10 simultaneous cold same-document requests -> one session in one-lane mode;
-- waiting request honors context cancellation;
-- bounded queue overflow returns retryable error;
-- many historical document keys do not leave an unbounded lane map;
-- different documents may proceed independently subject to worker limits.
+- canceled waiter never prompts;
+- queue overflow returns documented 429/503;
+- 1000 genuinely distinct historical document keys do not leave lane entries;
+- different documents can proceed subject to worker limits.
 
-## 10.6 Semantic-key stability probe
+## 7.5 Real process containment
 
-For one video and one article, observe safe hashes for 20-50 batches.
+On VPS:
 
-Exit criterion before long soak:
+- inspect daemon/harness PID/PPID/PGID/SID;
+- force retire and verify every owned harness disappears;
+- repeat several cycles and verify no orphan accumulation;
+- verify RAM/swap reaches a bounded range.
 
-- repeated batches do not unexpectedly generate new document keys, or
-- any deliberate key change has a documented bounded reason.
+## 7.6 Semantic-key probe
 
-## 10.7 YouTube soak
+For one YouTube page and one long article, log only safe component hashes for 20-50 batches:
 
-Run well beyond the prior ~25-minute collapse window.
+- normalized document identity;
+- stable semantic projection hash;
+- optional title/summary/terms component hashes for diagnostics.
 
-Exit criteria:
+No raw prompt text or sensitive content is required in these diagnostics.
 
-- first batch `document_bootstrap`, later batches `document_reuse`;
-- harness count does not grow with subtitle batch count;
-- swap stays bounded/stable rather than monotonic;
-- switching video/page makes progress even if the current worker has reached its cap;
-- translation remains responsive well past the old failure horizon.
-
-## 10.8 Long article burst
-
-Only after R2 is complete.
-
-Exit criteria:
-
-- cold burst singleflights;
-- wait queue is bounded/cancelable;
-- same document reuses one lane/session by default;
-- session/harness count stays bounded;
-- no goroutine/lane-map growth proportional to every historical page;
-- optional second lane is evaluated only if one lane causes real timeout problems.
+Exit criterion: repeated batches do not generate new document keys merely because volatile document context changed.
 
 ---
 
-# 11. Revised Implementation Order
+# 8. Revised Implementation Order After Second Review
 
-## Step 1 — Fix R1 fresh-demand forward progress
+## Step 1 — R1a: unify all worker retirement/removal paths
 
-This is the current hard blocker. **Status: implemented, tests green.**
+Fix the remaining `Release()` cross-key eviction path and factor a single retirement primitive.
 
-Add forced retirement of an **idle draining** worker when fresh-session demand otherwise cannot obtain a worker slot. Purge bindings and spawn replacement.
+**Exit criterion:** every worker removal that can invalidate bindings triggers the same binding-purge lifecycle exactly once.
 
-**Exit criterion:** `maxWorkers=1` cannot deadlock after reaching a session cap while holding a bound document/stateful session. *(Met by `TestAntigravityAcpPool_R1SingleWorkerFreshProgressAfterCap`; the full live VPS soak in Step 8 remains the production confirmation.)*
+## Step 2 — R1b: enforce/document physical process-capacity handoff
 
-## Step 2 — Fix R4 late-hit fallback correctness
+Do not let a logical slot imply the old process tree is already gone.
 
-Remove the incremental/full-payload race and add deterministic stream/non-stream tests.
+**Exit criterion:** replacement-process overlap never exceeds the documented hard bound.
 
-**Status: implemented, tests green.**
+## Step 3 — R4a: recheck strict turn sequence after worker lease
 
-All binding validation now completes INSIDE `acquireDocumentSession` /
-`acquireStatefulSession` (the PLAN's preferred option 1): both helpers
-return a fully resolved acquire result whose `hit` verdict is final, and
-the caller selects the incremental vs. full payload BEFORE starting the
-prompt builder goroutine. The old post-build `Lookup`-and-switch blocks
-(the data race and the incremental-payload leak into fresh sessions) are
-removed from both `Execute` and `ExecuteStream`. A hit lease is never
-re-decided after the builder starts; every miss bootstraps from the full
-request via the normal `openSession` path.
+**Exit criterion:** concurrent duplicate next-turn requests cannot append twice.
 
-**Exit criterion:** every bootstrap sends the full recovery payload; every incremental payload belongs to a verified hit. *(Met by `TestR4_DocumentLateInvalidationBootstrapsFullHistory`, `TestR4_StreamAndNonStreamAgreeOnLateInvalidation`, and `TestR4_StrictLateInvalidationBootstrapsFullHistory`.)*
+## Step 4 — R3a + R7: separate document context from stable semantic fingerprint
 
-## Step 3 — Replace document raw mutex lanes (R2)
+Use real-shaped **system prompt** fixtures. Ensure YouTube notification counter changes do not alter the final key.
 
-Implement context-aware bounded keyed lanes with automatic lifecycle cleanup.
+**Exit criterion:** `(132)` -> `(133)` on same YouTube page stays one document key/session while genuine translation-config changes rotate key.
 
-**Status: implemented, tests green.**
+## Step 5 — R2a: expose deterministic retryable lane backpressure
 
-`DocumentSessionTable.lanes` is now `map[string]*documentLane`: a
-capacity-1 token channel (empty = free, full = held) with reference-counted
-lifecycle. `AcquireLane(key, ctx, maxWaiters)` provides one-lane bootstrap
-singleflight, `ctx.Done()` cancellation while waiting, a bounded waiter
-queue (`DefaultDocumentLaneMaxWaiters`, overflow returns retryable
-`ErrDocumentLaneBusy`), automatic lane removal when the last reference
-drops (no growth proportional to historical pages), and pointer-identity
-staleness checks (ABA-safe releases from removed-and-recreated lanes). The
-executor's document acquisition uses `AcquireLane`; the raw-mutex
-`LockLane` remains only as a deprecated test helper.
+Map lane saturation to documented 429/503 and tighten canceled-acquire behavior/test fixture quality.
 
-**Exit criterion:** cancellation/backpressure/lane-GC tests pass and cold burst still creates one session. *(Met by `TestDocumentLane_GCManyHistoricalKeys`, `TestDocumentLane_CanceledWaiterExitsPromptly`, `TestDocumentLane_QueueLimitEnforced`, `TestDocumentLane_ColdBurstSingleflights` under `-race`, plus the existing document-reuse integration tests.)*
+## Step 6 — R6: one real `{{imt_title}}` probe
 
-## Step 4 — Fix title identity correctness (R3 + R6)
+Prefer direct machine title marker if it expands correctly; otherwise keep wrapped `title_prompt` fallback.
 
-- gate YouTube prefix normalization; **done** — `normalizeDocumentTitle`
-  strips `^\(\d+\)\s*` only when the title ends with ` - YouTube`;
-  ordinary numbered titles stay distinct
-  (`TestDocumentIdentityR3YouTubeGate`).
-- test direct `{{imt_title}}` marker in one live Immersive Translate request; **pending live probe (R6)**.
-- prefer direct marker if successful; **pending same probe**.
-- retain robust `title_prompt` fallback; **already in place** (`parseDocumentTitle` handles `Title: "..."` and `《...》` quoting).
+## Step 7 — R5: real VPS process-group/cleanup validation
 
-**Exit criterion:** identity is stable for real YouTube request and does not merge legitimate numbered article titles. *(Code-side criterion met and unit-tested; the live Immersive Translate probe below remains before the soak test.)*
+Inspect PGID/SID and force a controlled recycle.
 
-### R6 probe instructions (before Step 7)
+## Step 8 — R9: active-binding eviction/ledger consistency
 
-Capture one real request with the preferred prompt below and check whether
-the real page title appears inside the machine marker:
+Pin/defer eviction for actively leased strict/document bindings.
 
-```text
-[[CLIPROXY_ACP_DOCUMENT_TITLE:v1]]
-{{imt_title}}
-[[/CLIPROXY_ACP_DOCUMENT_TITLE]]
-{{title_prompt}}{{summary_prompt}}{{terms_prompt}}
-{{imt_style_guide}}
-```
+This can follow the immediate personal YouTube blockers, but must be complete before declaring the general lifecycle implementation finished.
 
-If yes: add the marker parser (`documentTitleMarkerStart/End`), strip the
-block before ACP, and make it the primary identity path, keeping the
-wrapped-`title_prompt` parser as fallback. If no: keep the current parser
-as primary and continue.
+## Step 9 — Short semantic/request sampling
 
-## Step 5 — Validate real process containment (R5)
+Capture 20-50 safe hashes from one video and one article and finalize semantic projection policy.
 
-Inspect real PGID/SID, force recycle, confirm daemon+harness cleanup.
-
-**Exit criterion:** real `localharness_external` processes are physically reclaimed by worker retirement.
-
-## Step 6 — Measure semantic fingerprint stability (R7)
-
-Run short video/article request samples before a long soak.
-
-**Exit criterion:** one page does not churn document sessions because summary/terms/system context changes unexpectedly; if it does, revise key projection first.
-
-## Step 7 — Configure final Immersive Translate integration
+## Step 10 — Configure Immersive Translate
 
 Headers:
 
@@ -942,65 +799,60 @@ X-ACP-Session-Scope: document
 X-ACP-Client: immersive-translate
 ```
 
-Preferred prompt if direct variable probe succeeds:
+Use the direct `imt_title` marker if Step 6 succeeds; otherwise use wrapped `title_prompt`.
 
-```text
-[[CLIPROXY_ACP_DOCUMENT_TITLE:v1]]
-{{imt_title}}
-[[/CLIPROXY_ACP_DOCUMENT_TITLE]]
-{{title_prompt}}{{summary_prompt}}{{terms_prompt}}
-{{imt_style_guide}}
-```
+## Step 11 — YouTube soak
 
-Fallback:
+Run well past the previous ~25-minute collapse window with hard session limits enabled.
 
-```text
-[[CLIPROXY_ACP_TITLE_PROMPT:v1]]
-{{title_prompt}}
-[[/CLIPROXY_ACP_TITLE_PROMPT]]
-{{summary_prompt}}{{terms_prompt}}
-{{imt_style_guide}}
-```
+Exit criteria:
 
-## Step 8 — YouTube soak test
+- first batch is `document_bootstrap`, subsequent same-page batches are `document_reuse`;
+- `session/new` does not grow with subtitle batch count except deliberate rollover/recycle;
+- harness count and swap remain bounded;
+- switching videos still makes progress when worker is at cap;
+- no title-counter key churn.
 
-Run well past the old failure horizon with hard worker session limits enabled.
+## Step 12 — Retry dedupe + long-article burst
 
-## Step 9 — Add/verify retry dedupe, then long-article burst test
+Add/verify duplicate response protection, then stress cold concurrent article batches and bounded queueing.
 
-Do not run the article concurrency test against an unbounded raw-mutex queue.
+## Step 13 — Tune TTL / rollover / lane / worker-cap defaults
 
-## Step 10 — Tune TTL / rollover / lane / worker-cap defaults
+Choose from measured context growth, TTFT, queue wait, harness count, RAM, and swap.
 
-Choose values from measured context growth, queue wait, TTFT, harness count, RAM, and swap.
+## Step 14 — Optional Origin compatibility detection
 
-## Step 11 — Optional compatibility Origin detection
+Only after explicit protocol is stable. Keep secondary/configurable.
 
-Only after the explicit contract is stable. Keep it disabled/configurable and secondary to explicit headers.
+## Step 15 — Micro-optimization only if TTFT data justifies it
 
-## Step 12 — Resume micro-optimization only if useful
-
-Potential remaining work:
+Possible work:
 
 - single-pass outbound ACP JSON encoding;
 - reduce repeated session-update decoding;
-- other allocation/copy improvements justified by TTFT stages.
+- other measured allocation/copy reductions.
 
-If backend generation dominates, stop rather than adding complexity for insignificant proxy-side savings.
+Do not optimize tiny proxy overhead while backend generation dominates.
 
 ---
 
-# 12. Guardrails / Non-Goals
+# 9. Guardrails / Non-Goals
 
 - Do not auto-reuse sessions for arbitrary clients.
 - Explicit document headers remain the primary/recommended integration contract.
 - `X-ACP-Session-Scope: document` defines semantics; `X-ACP-Client` does not.
 - Do not let a draining bound worker block fresh requests indefinitely.
-- Do not kill an in-use worker merely to free a slot.
-- Do not leave per-document lane metadata unbounded after bindings expire.
-- Do not use a non-cancelable unbounded mutex queue for article translation.
+- Do not kill an `inUse` worker merely to free a slot.
+- Do not leave stale bindings after any worker-removal path.
+- Do not claim a hard OS-process bound if replacement can start before old process-tree cleanup without an explicit bounded-overlap policy.
+- Do not leave per-document lane metadata or waiting goroutines unbounded.
+- Do not expose lane overflow as an accidental generic 500.
 - Do not globally strip `(number)` from document titles.
-- Do not send an incremental-only payload after a binding has been invalidated.
+- Do not hash dynamic document identity/context twice in the canonical key.
+- Do not send an incremental-only payload after binding invalidation.
+- Do not trust only a pre-wait strict turn check; revalidate after acquiring the owning worker.
+- Do not LRU/TTL-abandon an actively leased binding.
 - Do not treat document mode as exactly recoverable conversation state.
 - Do not split the core mechanism into separate YouTube/video and article affinity systems.
 - Do not claim title-only identity is universally collision-free.
