@@ -10,6 +10,14 @@
 - **session_mode**：绝大多数 `prepared`（pool_wait≈0-6ms，命中预备 session）；偶发 `fresh`（pool_wait 2.1s + session_new 804ms，双发时预备缓存被掏空）。
 - TTFT 4-9.6s，`backend_to_first_output` 占绝对大头（Google ACP 平台固有），代理侧开销可忽略。
 - **无 stateful_reuse**：插件不发 `X-Session-ID`/`X-ACP-Session-Reuse`，每请求独立。
+- **多段批量**：每个请求带 8 个字幕段（`[[p0]]`-`[[p7]]` + `[[source_end]]`），段号每批从 p0 重新编号——段号本身不携带跨请求的进度信息。
+
+### 请求内可区分标记（同视频识别，实测）
+- **有且仅有一个视频级标记**：prompt 的 Context Awareness 节固定携带 `Document Metadata:\nTitle: "<视频页标题> - YouTube"`。同一视频的全部请求该字符串恒定——实测 28 个请求全部命中同一标题（`(132) 反日の村に日本人が行ったら、現地の反応が想像以上にやばかった！【中国】 - YouTube`）；换页面（GitHub Options 页等）则 Title 随之变化。
+- **没有** URL、视频 ID（无 `watch?v=`/`youtu.be`）、时间戳或段序列号——无法从请求体直接定位视频内进度。
+- **Title 的不稳定前缀**：`(132) ` 是 YouTube 标签页的计数前缀（通知数），观看过程中可能变化。作分组键时应剥离 `^\(\d+\)\s` 前缀和 ` - YouTube` 后缀，取中间的纯视频标题。
+- 其余可分层区分：来源 IP（所有插件请求同出口）、User-Agent（代理日志未记录，Caddy 未开 access log）、请求体内容哈希。
+- 佐证存储形态：daemon conversations/ 每 session 一对 `<uuid>.db+.meta`；`meta` 仅 `{"cwd": ...}`；翻译 prompt 存于 `steps.step_payload`（UTF-8 原文，可用 `CAST(step_payload AS TEXT)` 提取，`strings` 会被多字节切断）。
 
 ## localharness / session 增长方式（核心发现）
 - `localharness_external` 是 **agy_acp_server.par（PID 58311）的子进程**，由 daemon 内部按 session 拉起（executor 通过 env `ANTIGRAVITY_HARNESS_PATH` 告知路径：antigravity_acp_executor.go:390-391，resolveHarness :254-258）。
