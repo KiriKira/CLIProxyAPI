@@ -21,7 +21,17 @@ const (
 	documentTitlePromptEnd   = "[[/CLIPROXY_ACP_TITLE_PROMPT]]"
 )
 
+// youtubeTitleDecoration strips a leading YouTube notification counter
+// (e.g. "(132) ") from a page title. R3: this is a YouTube tab-title
+// decoration, NOT a generic title pattern — a bare "(1) Introduction" vs
+// "(2) Introduction" are legitimate distinct documents and must never be
+// merged. Callers must gate it on recognizable YouTube evidence
+// (see normalizeDocumentTitle).
 var youtubeTitleDecoration = regexp.MustCompile(`^\(\d+\)\s*`)
+
+// youtubeTitleSuffix is the recognizability gate for YouTube decoration
+// stripping: browser tab titles for youtube.com pages end with this marker.
+const youtubeTitleSuffix = " - YouTube"
 
 type documentSignals struct {
 	enabled    bool
@@ -136,7 +146,14 @@ func parseDocumentTitle(text string) string {
 
 func normalizeDocumentTitle(title string) string {
 	title = strings.Join(strings.Fields(strings.TrimSpace(title)), " ")
-	return youtubeTitleDecoration.ReplaceAllString(title, "")
+	// R3: strip the YouTube notification counter only when the title is
+	// recognizably a YouTube tab title. Ordinary documents beginning with
+	// "(number)" (e.g. "(1) Introduction", "(2024) Annual Report") stay
+	// distinct. A future real URL/document id should replace this heuristic.
+	if strings.HasSuffix(title, youtubeTitleSuffix) {
+		return youtubeTitleDecoration.ReplaceAllString(title, "")
+	}
+	return title
 }
 
 func newestDocumentUserBatch(root any) ([]byte, error) {

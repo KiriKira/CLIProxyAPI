@@ -69,12 +69,16 @@ Reviewed branch head: `ee3b2605a9e93bb4f3a162751ec582cbcbf80cc5`.
   the prompt builder starts only after the hit/miss verdict is final, so no
   incremental payload can leak into a fresh session and the captured
   `promptPayload` is never mutated after the goroutine starts.
+- **R3 — FIXED.** YouTube notification-prefix normalization gated on the
+  ` - YouTube` tab-title suffix; ordinary `(number)` titles stay distinct
+  (see Step 4 below).
 - **R2 — FIXED.** Raw per-key mutex lanes replaced with context-aware,
   reference-counted, bounded token-channel lanes (`AcquireLane`): ctx
   cancellation while waiting, bounded waiter queue with retryable
   `ErrDocumentLaneBusy`, lane GC on last reference, ABA-safe releases (see
   Step 3 below).
-- R3/R5-R8: not started; order below is unchanged.
+- R3 — FIXED (code side). R5/R6/R7 need the live VPS / real plugin probes;
+  order below is unchanged.
 
 The branch contains the right overall direction:
 
@@ -888,12 +892,33 @@ executor's document acquisition uses `AcquireLane`; the raw-mutex
 
 ## Step 4 — Fix title identity correctness (R3 + R6)
 
-- gate YouTube prefix normalization;
-- test direct `{{imt_title}}` marker in one live Immersive Translate request;
-- prefer direct marker if successful;
-- retain robust `title_prompt` fallback.
+- gate YouTube prefix normalization; **done** — `normalizeDocumentTitle`
+  strips `^\(\d+\)\s*` only when the title ends with ` - YouTube`;
+  ordinary numbered titles stay distinct
+  (`TestDocumentIdentityR3YouTubeGate`).
+- test direct `{{imt_title}}` marker in one live Immersive Translate request; **pending live probe (R6)**.
+- prefer direct marker if successful; **pending same probe**.
+- retain robust `title_prompt` fallback; **already in place** (`parseDocumentTitle` handles `Title: "..."` and `《...》` quoting).
 
-**Exit criterion:** identity is stable for real YouTube request and does not merge legitimate numbered article titles.
+**Exit criterion:** identity is stable for real YouTube request and does not merge legitimate numbered article titles. *(Code-side criterion met and unit-tested; the live Immersive Translate probe below remains before the soak test.)*
+
+### R6 probe instructions (before Step 7)
+
+Capture one real request with the preferred prompt below and check whether
+the real page title appears inside the machine marker:
+
+```text
+[[CLIPROXY_ACP_DOCUMENT_TITLE:v1]]
+{{imt_title}}
+[[/CLIPROXY_ACP_DOCUMENT_TITLE]]
+{{title_prompt}}{{summary_prompt}}{{terms_prompt}}
+{{imt_style_guide}}
+```
+
+If yes: add the marker parser (`documentTitleMarkerStart/End`), strip the
+block before ACP, and make it the primary identity path, keeping the
+wrapped-`title_prompt` parser as fallback. If no: keep the current parser
+as primary and continue.
 
 ## Step 5 — Validate real process containment (R5)
 

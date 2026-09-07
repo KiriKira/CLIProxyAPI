@@ -83,6 +83,38 @@ func TestDocumentSignalsRequireExplicitScopeAndReuse(t *testing.T) {
 	}
 }
 
+// TestDocumentIdentityR3YouTubeGate covers the R3 normalization rules:
+//   - YouTube tab titles keep their notification-counter normalization;
+//   - ordinary numbered titles stay distinct (never merged);
+//   - a "(year)" prefix on a non-YouTube title is untouched.
+func TestDocumentIdentityR3YouTubeGate(t *testing.T) {
+	signals := documentSignals{enabled: true, client: "immersive-translate"}
+	build := func(title string) []byte {
+		return []byte(`{"messages":[{"role":"system","content":"t"},{"role":"user","content":"[[CLIPROXY_ACP_TITLE_PROMPT:v1]]\nTitle: \"` + title + `\"\n[[/CLIPROXY_ACP_TITLE_PROMPT]]\nbatch"}]}`)
+	}
+	keyOf := func(t *testing.T, title string) string {
+		t.Helper()
+		info, err := prepareDocumentRequest(build(title), "auth", "model", signals, "openai")
+		if err != nil {
+			t.Fatalf("prepare %q: %v", title, err)
+		}
+		return info.key
+	}
+
+	// (132)/(133) Foo - YouTube normalize to the same identity.
+	if k1, k2 := keyOf(t, "(132) Foo - YouTube"), keyOf(t, "(133) Foo - YouTube"); k1 != k2 {
+		t.Fatalf("YouTube notification counters must not split identity")
+	}
+	// (1) Introduction and (2) Introduction remain distinct documents.
+	if k1, k2 := keyOf(t, "(1) Introduction"), keyOf(t, "(2) Introduction"); k1 == k2 {
+		t.Fatalf("legitimate numbered article titles were merged (R3 regression)")
+	}
+	// (2024) Annual Report remains unchanged (also distinct from others).
+	if k1, k2 := keyOf(t, "(2024) Annual Report"), keyOf(t, "Annual Report"); k1 == k2 {
+		t.Fatalf("year prefix was stripped from a non-YouTube title (R3 regression)")
+	}
+}
+
 func TestDocumentSessionTableLaneSerializesSameKey(t *testing.T) {
 	table := helps.NewDocumentSessionTable(time.Minute, 10)
 	first := table.LockLane("same")
