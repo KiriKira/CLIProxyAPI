@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 
@@ -15,6 +16,24 @@ func documentOpts(client string) cliproxyexecutor.Options {
 		cliproxyexecutor.ACPDocumentReuseMetadataKey:  true,
 		cliproxyexecutor.ACPDocumentClientMetadataKey: client,
 	}}
+}
+
+func TestDocumentReuseFiftySequentialRequestsUseOneSession(t *testing.T) {
+	script := statefulLogAgent(t)
+	execer := NewAntigravityAcpExecutor(&internalconfig.Config{Antigravity: internalconfig.AntigravityConfig{PersistentProcess: boolPtr(true)}})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"binary_path": script,
+		"gemini_home": t.TempDir(),
+	}}
+	opts := documentOpts("immersive-translate")
+	for i := 0; i < 50; i++ {
+		payload := `{"messages":[{"role":"system","content":"You translate."},{"role":"user","content":"[[CLIPROXY_ACP_TITLE_PROMPT:v1]]\nTitle: \"Example video - YouTube\"\n[[/CLIPROXY_ACP_TITLE_PROMPT]]\nsequential batch ` + strconv.Itoa(i) + `"}]}`
+		statefulRequest(t, execer, auth, opts, payload)
+	}
+	methods := readStatefulLog(t, script, "methods.log")
+	if got := strings.Count(methods, "session/new"); got != 1 {
+		t.Fatalf("50 sequential document requests created %d sessions, want 1\nlog: %s", got, methods)
+	}
 }
 
 func TestDocumentReuseSameTitleSharesSessionAndSendsOnlyNewestBatch(t *testing.T) {
