@@ -683,6 +683,8 @@ Add/verify a bounded recent-request fingerprint/response cache before aggressive
 
 Choose from measured context growth, TTFT, queue wait, harness count, RAM, and swap.
 
+Measured baseline + recommended caps recorded in `docs/antigravity-acp-memory-caps_CN.md` (2026-09-08, moecloud): document-bound harnesses cost 60-120MB each (not the 7-9MB empty-session figure); recommended `max-sessions-per-worker: 6`, `max-stateful-sessions: 16`, `stateful-session-ttl: 30m`, `idle-timeout: 45m` are now applied on the VPS. Single-session unbounded growth still needs the §5 rollover knobs.
+
 ## Step 10 — Optional Origin compatibility detection
 
 Only after explicit protocol is stable. Keep secondary/configurable.
