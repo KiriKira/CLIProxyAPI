@@ -77,13 +77,13 @@ d27e9936  fix(acp): hold binding leases across streams
 - **R4 / full-vs-incremental decision before prompt build: DONE in code.** No post-start payload switch remains.
 - **R4a / strict monotonic turn race: DONE in code.** Turn order is rechecked after `AcquireSpecific()` and authoritative binding lookup, so concurrent duplicate turns cannot both append incrementally.
 - **R9 / active binding eviction consistency: DONE in code.** Strict and document bindings are pinned while leased; eviction/expiry can be deferred. The latest streaming fix holds those leases until the stream goroutine actually finishes.
-- **R6 / direct document-title marker stripping: NEW BLOCKER found in third review.** The direct machine-only marker currently removes only delimiter strings; its title body remains model-visible. This must be fixed before asking the user to adopt the direct `{{imt_title}}` prompt.
+- **R6 / direct document-title marker stripping: FIXED in code (commit `f076ec37`, pending fourth review + live probe).** `stripDocumentMarkers()` now treats the two marker families differently: the direct `CLIPROXY_ACP_DOCUMENT_TITLE` block is removed ENTIRELY (delimiters + title body) before ACP prompt construction, while the wrapped `CLIPROXY_ACP_TITLE_PROMPT` keeps delimiter-only stripping with its inner expanded content model-visible. Unterminated direct blocks fall back to delimiter removal; the semantic fingerprint already excluded complete marker blocks, which the new fingerprint test now proves.
 - **R5 / real process containment: PENDING LIVE VALIDATION.** Fake process-group tests do not prove the real `localharness_external` never detaches.
 - **R7 / real semantic-key stability: PENDING LIVE VALIDATION.** Real Immersive Translate batches must prove summary/terms/title behavior does not rotate the document key unexpectedly.
 
 GitHub `pr-test-build` for `d27e993...` completed successfully, but that workflow is currently a build gate rather than proof of all unit/race/live tests.
 
-Do **not** start the final long YouTube soak yet. First fix R6, then run the short R5/R6/R7 probes below. No additional lifecycle architecture rewrite is currently indicated.
+R6 code fix landed as commit `f076ec37` on this branch; its `pr-test-build` run is the build gate for the fix. Do **not** start the final long YouTube soak yet. Next: run the short R5/R6/R7 probes below (Step 2 live `{{imt_title}}` probe first — it decides direct-marker vs wrapped-fallback adoption). No additional lifecycle architecture rewrite is currently indicated.
 
 ---
 
