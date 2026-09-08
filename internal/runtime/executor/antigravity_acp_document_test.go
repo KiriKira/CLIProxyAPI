@@ -112,6 +112,82 @@ func TestDocumentDirectTitleMarkerIsSupported(t *testing.T) {
 	}
 }
 
+// TestDocumentDirectTitleMarkerIsMachineOnly covers the R6 blocker: the
+// direct CLIPROXY_ACP_DOCUMENT_TITLE block is machine-only routing identity
+// and must disappear from the model payload in full (delimiters AND title
+// body), while ordinary model-visible title context and the wrapped
+// CLIPROXY_ACP_TITLE_PROMPT content survive cleaning.
+func TestDocumentDirectTitleMarkerIsMachineOnly(t *testing.T) {
+	signals := documentSignals{enabled: true, client: "immersive-translate"}
+	payload := []byte(`{"messages":[{"role":"system","content":"stable translation instructions\n[[CLIPROXY_ACP_DOCUMENT_TITLE:v1]]\nExample Video - YouTube\n[[/CLIPROXY_ACP_DOCUMENT_TITLE]]\nDocument Metadata:\nTitle: \"Example Video - YouTube\""},{"role":"user","content":"[[CLIPROXY_ACP_TITLE_PROMPT:v1]]\nTitle: \"Example Video - YouTube\"\n[[/CLIPROXY_ACP_TITLE_PROMPT]]\nbatch"}]}`)
+	info, err := prepareDocumentRequest(payload, "auth", "model", signals, "openai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.title != "Example Video - YouTube" {
+		t.Fatalf("routing title = %q, want Example Video - YouTube", info.title)
+	}
+	cleaned := string(info.cleanedPayload)
+	if strings.Contains(cleaned, documentDocumentTitleStart) || strings.Contains(cleaned, documentDocumentTitleEnd) {
+		t.Fatalf("direct marker delimiters survived cleaning: %s", cleaned)
+	}
+	if strings.Contains(cleaned, "Example Video - YouTube\n\nDocument Metadata") {
+		t.Fatalf("direct marker body survived as a standalone title line: %s", cleaned)
+	}
+	if strings.Count(cleaned, "Example Video - YouTube") != 2 {
+		t.Fatalf("model-visible title context lost or duplicated (want exactly Document Metadata + wrapped title_prompt occurrences): %s", cleaned)
+	}
+	if !strings.Contains(cleaned, "Document Metadata") || !strings.Contains(cleaned, "Title: \\\"Example Video - YouTube\\\"") {
+		t.Fatalf("ordinary Document Metadata title context must stay model-visible: %s", cleaned)
+	}
+	if strings.Contains(cleaned, documentTitlePromptStart) || strings.Contains(cleaned, documentTitlePromptEnd) {
+		t.Fatalf("wrapped marker delimiters survived cleaning: %s", cleaned)
+	}
+	if !strings.Contains(cleaned, "Title: \\\"Example Video - YouTube\\\"\\n[[") && strings.Count(cleaned, "Title: \\\"Example Video - YouTube\\\"") < 2 {
+		t.Fatalf("wrapped CLIPROXY_ACP_TITLE_PROMPT inner context must stay model-visible: %s", cleaned)
+	}
+}
+
+// TestDocumentDirectMarkerBodyExcludedFromSemanticFingerprint proves the
+// direct machine block cannot rotate the document key via the semantic
+// projection: two payloads differing only inside the direct marker (same
+// normalized YouTube identity) must produce the same key.
+func TestDocumentDirectMarkerBodyExcludedFromSemanticFingerprint(t *testing.T) {
+	signals := documentSignals{enabled: true, client: "immersive-translate"}
+	build := func(counter string) []byte {
+		return []byte(`{"messages":[{"role":"system","content":"translate\n[[CLIPROXY_ACP_DOCUMENT_TITLE:v1]]\n(` + counter + `) Demo - YouTube\n[[/CLIPROXY_ACP_DOCUMENT_TITLE]]"},{"role":"user","content":"batch"}]}`)
+	}
+	one, err := prepareDocumentRequest(build("132"), "auth", "model", signals, "openai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	two, err := prepareDocumentRequest(build("133"), "auth", "model", signals, "openai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if one.key != two.key {
+		t.Fatalf("direct marker body leaked into the semantic fingerprint: %q != %q", one.key, two.key)
+	}
+}
+
+// TestDocumentDirectMarkerUnterminatedBlock verifies an unterminated direct
+// marker (start without end) still loses its delimiter token and falls back
+// to ordinary title parsing instead of keeping the body as identity.
+func TestDocumentDirectMarkerUnterminatedBlock(t *testing.T) {
+	signals := documentSignals{enabled: true, client: "immersive-translate"}
+	payload := []byte(`{"messages":[{"role":"system","content":"translate\n[[CLIPROXY_ACP_DOCUMENT_TITLE:v1]]\nUnfinished - YouTube\nDocument Metadata:\nTitle: \"Real - YouTube\""},{"role":"user","content":"batch"}]}`)
+	info, err := prepareDocumentRequest(payload, "auth", "model", signals, "openai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.title != "Real - YouTube" {
+		t.Fatalf("unterminated marker should fall back to metadata title, got %q", info.title)
+	}
+	if strings.Contains(string(info.cleanedPayload), documentDocumentTitleStart) {
+		t.Fatalf("unterminated direct marker delimiter survived cleaning: %s", info.cleanedPayload)
+	}
+}
+
 func TestDocumentLaneOverflowMapsToRetryable429(t *testing.T) {
 	err := documentLaneBackpressureError(helps.ErrDocumentLaneBusy)
 	status, ok := err.(requestScopedStatusErr)

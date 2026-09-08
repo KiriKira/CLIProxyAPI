@@ -172,15 +172,40 @@ func documentMarkerTitle(text string) (string, bool) {
 	return strings.TrimSpace(title), found
 }
 
+// R6: the two markers have deliberately different stripping semantics.
+//
+//   - CLIPROXY_ACP_DOCUMENT_TITLE is machine-only routing identity. Its
+//     ENTIRE block (including the title body) is removed before ACP prompt
+//     construction; the extracted title lives in documentRequestInfo.title
+//     only. Leaving the body visible would duplicate the page title next to
+//     the ordinary model-visible Document Metadata / title_prompt context.
+//   - CLIPROXY_ACP_TITLE_PROMPT is a compatibility wrapper around normal
+//     title_prompt content: strip only its delimiters and keep the expanded
+//     inner context model-visible.
 func stripDocumentMarkers(text string) string {
-	for _, marker := range [][2]string{
-		{documentTitlePromptStart, documentTitlePromptEnd},
-		{documentDocumentTitleStart, documentDocumentTitleEnd},
-	} {
-		text = strings.ReplaceAll(text, marker[0], "")
-		text = strings.ReplaceAll(text, marker[1], "")
-	}
+	text = removeCompleteMarkerBlocks(text, documentDocumentTitleStart, documentDocumentTitleEnd)
+	text = strings.ReplaceAll(text, documentTitlePromptStart, "")
+	text = strings.ReplaceAll(text, documentTitlePromptEnd, "")
 	return text
+}
+
+// removeCompleteMarkerBlocks deletes every complete start..end block,
+// including the enclosed body. An unterminated block (start without end)
+// falls back to removing the stray delimiter so machine tokens never leak
+// into the model payload.
+func removeCompleteMarkerBlocks(text, start, end string) string {
+	for {
+		s := strings.Index(text, start)
+		if s < 0 {
+			return text
+		}
+		contentStart := s + len(start)
+		e := strings.Index(text[contentStart:], end)
+		if e < 0 {
+			return strings.ReplaceAll(text, start, "")
+		}
+		text = text[:s] + text[contentStart+e+len(end):]
+	}
 }
 
 func stripVolatileDocumentContext(text string) string {
