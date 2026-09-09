@@ -699,6 +699,20 @@ Possible work:
 
 Do not optimize tiny proxy overhead while backend generation dominates.
 
+## Step 12 — Proxy-side daemon hang containment (prompt-stall watchdog)
+
+The 2026-09-09 moecloud incident (`docs/antigravity-acp-hang-20260909_CN.md`, improvement direction 3) showed the structural failure mode of a single-worker deployment: the daemon wedged with a live transport and zero output after one anomalously slow Google interaction, every later request queued behind it until a manual `systemctl restart cliproxy`, and no request-level timeout existed to break the wedge.
+
+Implemented in this branch:
+
+- `antigravity.prompt-stall-timeout` (duration string; empty/`"0"`/below `5s` disables) bounds one ACP `session/prompt` turn by its **output-silence span**, not total elapsed time. Every inbound stdout line and every `session/update` notification resets the window, so slow-but-progressing turns (20KB inputs, long thinking, streaming chunks) never expire; only a genuinely wedged daemon trips it. Default recommendation for moecloud: `90s` (observed worst first-output latency is ~6s; 15x margin).
+- On trip: the request fails with **504** (`ACP prompt stall detected...` log line), the worker is marked unhealthy, all its strict/document bindings are purged, and it retires through the unified retirement path (physical process-tree kill, R1b handoff). The next request spawns a fresh daemon — automatic recovery in <= timeout + restart span instead of a manual restart.
+- Both `Execute` and `ExecuteStream` paths are covered; non-stall prompt errors keep the legacy 500 code.
+
+Tests: `antigravity_acp_stall_test.go` (integration: watchdog 504 + fresh-worker recovery on both stream and non-stream paths; disabled keeps legacy wait; streaming activity never trips; sub-floor config disarms), `antigravity_acp_stall_unit_test.go` (watchdog unit: trip/kick/nil).
+
+Exit criterion: on moecloud, a wedged daemon self-recovers — the watchdog logs the stall, retires the worker, and the following request succeeds without operator action.
+
 ---
 
 # 9. Guardrails / Non-Goals

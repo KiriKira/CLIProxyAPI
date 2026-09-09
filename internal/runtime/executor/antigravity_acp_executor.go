@@ -16,6 +16,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -47,6 +48,9 @@ type AntigravityAcpExecutor struct {
 	// documentLaneMaxWaiters is zero in production to use the bounded table
 	// default; tests may lower it to exercise HTTP backpressure deterministically.
 	documentLaneMaxWaiters int
+	// promptStallTimeout bounds one ACP turn by its output-silence span.
+	// Zero disables the watchdog (legacy unlimited-wait behavior).
+	promptStallTimeout time.Duration
 }
 
 func (e *AntigravityAcpExecutor) authPoolKey(auth *cliproxyauth.Auth) string {
@@ -101,6 +105,14 @@ func NewAntigravityAcpExecutor(cfg *internalconfig.Config) *AntigravityAcpExecut
 		}
 		if cfg.Antigravity.MaxAbandonedSessionsPerWorker > 0 {
 			maxAbandonedPerWorker = cfg.Antigravity.MaxAbandonedSessionsPerWorker
+		}
+		// Output-silence watchdog: bound a wedged daemon turn (the
+		// 2026-09-09 hang signature) instead of queueing every later
+		// request behind it forever. Values below acpMinStallTimeout
+		// disable the watchdog so a typo cannot turn productive slow
+		// turns into guaranteed failures.
+		if d, err := time.ParseDuration(cfg.Antigravity.PromptStallTimeout); err == nil && d >= acpMinStallTimeout {
+			exec.promptStallTimeout = d
 		}
 	}
 
@@ -1208,6 +1220,107 @@ func openSession(ctx context.Context, client *acp.Client, worker *helps.Antigrav
 // acpTTFTStage records one stage boundary of the ACP request path. Stage
 // timings distinguish proxy overhead from backend/model latency so
 // optimization effort follows the dominant cost instead of guesswork.
+// acpMinStallTimeout is the smallest prompt-stall-timeout that actually
+// arms the watchdog. Real Google-side first responses observed in
+// production span 0.6-6s; anything below this floor is treated as a
+// config typo and disables the watchdog rather than failing healthy
+// slow turns.
+const acpMinStallTimeout = 5 * time.Second
+
+// acpPromptWatchdog bounds one ACP session/prompt turn by its
+// OUTPUT-SILENCE span, not by total elapsed time. Every inbound stdout
+// line and every session/update notification proves the daemon is alive
+// and resets the silence window; only a genuinely wedged daemon (alive
+// transport, zero progress — the 2026-09-09 single-worker hang that
+// starved all later requests until a manual restart) trips the timeout.
+//
+// On expiry the watchdog returns errStallDetected; the caller marks the
+// worker unhealthy so the pool's unified retirement path physically
+// kills the daemon process tree and the next request spawns a fresh
+// daemon. A slow-but-progressing turn (20KB input, long thinking,
+// streaming chunks) never expires. A nil watchdog disables the bound.
+type acpPromptWatchdog struct {
+	timeout time.Duration
+	// lastActivity is stored/loaded atomically as unix nanoseconds. The
+	// ACP reader goroutine is the only writer, so atomic access keeps
+	// the polling in Wait race-free without a mutex.
+	lastActivity atomic.Int64
+}
+
+// newACPPromptWatchdog arms a silence watchdog for one prompt turn.
+func newACPPromptWatchdog(timeout time.Duration) *acpPromptWatchdog {
+	w := &acpPromptWatchdog{timeout: timeout}
+	w.lastActivity.Store(time.Now().UnixNano())
+	return w
+}
+
+// kick records fresh daemon activity (any stdout line, any
+// session/update) and resets the silence window. Called from the ACP
+// reader goroutine while the turn is in flight.
+func (w *acpPromptWatchdog) kick() {
+	if w == nil {
+		return
+	}
+	w.lastActivity.Store(time.Now().UnixNano())
+}
+
+// Wait runs fn on a dedicated goroutine and blocks until fn completes,
+// the request context is canceled, or the silence window expires —
+// whichever comes first. fn MUST honor ctx cancellation so the ctx branch
+// can collect its outcome without racing state captured by the caller.
+// It returns errStallDetected only on watchdog expiry; on stall fn is
+// abandoned (it unblocks when the retirement kills the process tree and
+// failAllPending resolves the pending call). A nil watchdog or zero
+// timeout preserves legacy semantics exactly.
+func (w *acpPromptWatchdog) Wait(ctx context.Context, fn func(context.Context) error) error {
+	done := make(chan error, 1)
+	go func() {
+		done <- fn(ctx)
+	}()
+
+	if w == nil || w.timeout == 0 {
+		// Watchdog disabled: legacy behavior. fn is ctx-aware, so on
+		// cancellation its own error (context.DeadlineExceeded etc.) is
+		// what the caller used to see; drain it instead of guessing.
+		select {
+		case err := <-done:
+			return err
+		case <-ctx.Done():
+			if err := <-done; err != nil {
+				return err
+			}
+			return ctx.Err()
+		}
+	}
+
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case err := <-done:
+			return err
+		case <-ctx.Done():
+			if err := <-done; err != nil {
+				return err
+			}
+			return ctx.Err()
+		case <-ticker.C:
+			last := time.Unix(0, w.lastActivity.Load())
+			if time.Since(last) >= w.timeout {
+				return errStallDetected
+			}
+		}
+	}
+}
+
+// errStallDetected is returned by the watchdog when a turn exceeded the
+// configured output-silence window. The caller maps it to HTTP 504 and
+// treats the worker as unhealthy.
+var errStallDetected = errors.New("acp: prompt stalled: no daemon output within the configured silence window")
+
+// acpTTFTStage records one stage boundary of the ACP request path. Stage
+// timings distinguish proxy overhead from backend/model latency so
+// optimization effort follows the dominant cost instead of guesswork.
 type acpTTFTStage struct {
 	requestEnter time.Time
 	poolAcquired time.Time
@@ -1601,6 +1714,10 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 	var thoughtText strings.Builder
 	var mu sync.Mutex
 
+	// Arming the silence watchdog must precede the reader-goroutine hooks
+	// below so their closures can kick it on every inbound line/update.
+	wd := newACPPromptWatchdog(e.promptStallTimeout)
+
 	client.SetOnRequestWritten(func(method string) {
 		if method == "session/prompt" {
 			stages.markPromptWritten(time.Now())
@@ -1608,6 +1725,7 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 	})
 	client.SetOnFirstLine(func() {
 		stages.markStdoutLine(time.Now())
+		wd.kick()
 	})
 	client.OnUpdate(func(u acp.SessionUpdate) {
 		if u.SessionID != sessionID {
@@ -1615,6 +1733,7 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 		}
 		now := time.Now()
 		stages.markFirstACPUpdate(now)
+		wd.kick()
 		mu.Lock()
 		defer mu.Unlock()
 
@@ -1651,9 +1770,25 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 		}
 	}()
 
-	stopReason, err := client.Prompt(ctx, sessionID, prompt.blocks)
+	var stopReason string
+	promptCall := func(callCtx context.Context) error {
+		var promptErr error
+		stopReason, promptErr = client.Prompt(callCtx, sessionID, prompt.blocks)
+		return promptErr
+	}
+	err = wd.Wait(ctx, promptCall)
 	if err != nil {
-		if acp.IsTransportError(err) {
+		statusCode := http.StatusInternalServerError
+		if errors.Is(err, errStallDetected) {
+			healthy = false
+			statusCode = http.StatusGatewayTimeout
+			log.WithFields(log.Fields{
+				"provider":   "antigravity-acp",
+				"session_id": sessionID,
+				"model":      req.Model,
+				"stream":     false,
+			}).Error("ACP prompt stall detected: daemon produced no output within the silence window; worker will be retired")
+		} else if acp.IsTransportError(err) {
 			healthy = false
 		}
 		if worker != nil && !statefulHit {
@@ -1669,7 +1804,7 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 				e.invalidateStateful(signals, authKey)
 			}
 		}
-		return resp, statusErr{code: http.StatusInternalServerError, msg: fmt.Sprintf("ACP prompt error: %v", err)}
+		return resp, statusErr{code: statusCode, msg: fmt.Sprintf("ACP prompt error: %v", err)}
 	}
 	if documentMode && worker != nil {
 		e.document.Bind(documentKey, sessionID, authKey, resolvedVariant, worker)
@@ -1926,6 +2061,11 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 		defer prompt.cleanup()
 		stages.markPromptBuilt()
 
+		// Arming the silence watchdog must precede the reader-goroutine
+		// hooks below so their closures can kick it on every inbound
+		// line/update.
+		wd := newACPPromptWatchdog(e.promptStallTimeout)
+
 		client.SetOnRequestWritten(func(method string) {
 			if method == "session/prompt" {
 				stages.markPromptWritten(time.Now())
@@ -1933,6 +2073,7 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 		})
 		client.SetOnFirstLine(func() {
 			stages.markStdoutLine(time.Now())
+			wd.kick()
 		})
 		client.OnUpdate(func(u acp.SessionUpdate) {
 			if u.SessionID != sessionID {
@@ -1940,6 +2081,7 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 			}
 			now := time.Now()
 			stages.markFirstACPUpdate(now)
+			wd.kick()
 
 			switch u.Kind {
 			case "agent_message_chunk":
@@ -1976,9 +2118,23 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 			}
 		}()
 
-		_, promptErr := client.Prompt(ctx, sessionID, prompt.blocks)
+		promptCall := func(callCtx context.Context) error {
+			_, promptErr := client.Prompt(callCtx, sessionID, prompt.blocks)
+			return promptErr
+		}
+		promptErr := wd.Wait(ctx, promptCall)
 		if promptErr != nil {
-			if acp.IsTransportError(promptErr) {
+			statusCode := http.StatusInternalServerError
+			if errors.Is(promptErr, errStallDetected) {
+				healthy = false
+				statusCode = http.StatusGatewayTimeout
+				log.WithFields(log.Fields{
+					"provider":   "antigravity-acp",
+					"session_id": sessionID,
+					"model":      req.Model,
+					"stream":     true,
+				}).Error("ACP prompt stall detected: daemon produced no output within the silence window; worker will be retired")
+			} else if acp.IsTransportError(promptErr) {
 				healthy = false
 			}
 			if worker != nil && !statefulHit {
@@ -1995,7 +2151,7 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 			}
 			log.Errorf("ACP prompt stream error: %v", promptErr)
 			chunkChan <- cliproxyexecutor.StreamChunk{
-				Err: promptErr,
+				Err: statusErr{code: statusCode, msg: fmt.Sprintf("ACP prompt error: %v", promptErr)},
 			}
 			return
 		}

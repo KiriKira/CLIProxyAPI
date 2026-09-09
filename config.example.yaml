@@ -312,6 +312,10 @@ codex:
 #   idle-timeout: "0"             # optional: terminate idle persistent workers after duration (e.g. "10m", "1h"); "0" means stay warm
 #   stateful-session-ttl: "30m"   # optional: TTL for opt-in stateful ACP session bindings; refreshes on use
 #   max-stateful-sessions: 256    # optional: LRU bound for the stateful binding table
+#   prompt-stall-timeout: "90s"   # optional: fail a turn after this much daemon OUTPUT SILENCE (resets on every
+#                                 # stdout line / session update; slow-but-streaming turns never trip). On trip:
+#                                 # 504 + worker retired (process tree killed) so the next request spawns a fresh
+#                                 # daemon — bounds the wedged-daemon hang instead of queueing forever. "0"/off disables.
 #                                 # Stateful reuse is client opt-in per request:
 #                                 #   X-Session-ID: <stable logical session id>
 #                                 #   X-ACP-Session-Reuse: 1

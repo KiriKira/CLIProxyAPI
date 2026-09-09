@@ -195,6 +195,17 @@ type AntigravityConfig struct {
 	// bootstraps from the full history. Default: 256 when stateful reuse
 	// is used at all; 0 keeps the default.
 	MaxStatefulSessions int `yaml:"max-stateful-sessions,omitempty" json:"max-stateful-sessions,omitempty"`
+	// PromptStallTimeout bounds a single ACP session/prompt turn by its
+	// OUTPUT-SILENCE span: the watchdog resets on every stdout line and
+	// every session/update notification, so only a genuinely wedged daemon
+	// (alive transport, zero progress — the 2026-09-09 hang signature)
+	// trips it. A slow-but-streaming turn never expires. On expiry the
+	// request fails with 504, the worker is marked unhealthy, purged of
+	// all session bindings, and retired through the normal unified path
+	// (process tree killed); the next request spawns a fresh daemon.
+	// Empty, "0", or a value below 5s disables the watchdog. Example:
+	// "90s".
+	PromptStallTimeout string `yaml:"prompt-stall-timeout,omitempty" json:"prompt-stall-timeout,omitempty"`
 	// DaemonEnv appends extra environment variables to every ACP daemon
 	// spawn (KEY=VALUE entries, applied after the built-in env so they can
 	// override). The daemon process env is otherwise a fixed whitelist, so
