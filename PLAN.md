@@ -713,6 +713,20 @@ Tests: `antigravity_acp_stall_test.go` (integration: watchdog 504 + fresh-worker
 
 Exit criterion: on moecloud, a wedged daemon self-recovers — the watchdog logs the stall, retires the worker, and the following request succeeds without operator action.
 
+## Step 13 — Client response-shape compatibility (immersive-translate "failed" triage)
+
+2026-09-10 live triage of recurring immersive-translate "translation failed" reports: server logs showed HTTP 200 with valid translations, meaning strict client-side response validation was rejecting otherwise successful completions. Three defects found and fixed:
+
+- **Non-OpenAI `finish_reason`**: the non-stream response carried the ACP agent's native `end_turn` value; normalized to `stop` (empty/`end_turn` → `stop`) in `kiri.13`.
+- **Double-prefixed stream terminal**: the executor emitted `data: [DONE]\n\n` unconditionally, while the Chat Completions outer writer appends its own `data: [DONE]` once the channel closes — producing a `data: data: [DONE]` bad frame that strict SSE parsers reject. Fix (`kiri.13`): format-specific termination — for `FormatOpenAIResponse` the executor emits a bare `[DONE]` (consumed by the Responses translator to synthesize `response.completed`); for Chat Completions it emits nothing and the outer writer owns the marker.
+- **Non-standard `reasoning_content`**: the non-stream assistant message included the agent thought transcript under a non-OpenAI field; strict validators reject the whole completion. Fix (`kiri.14`): the non-stream message carries only `role`/`content`; thinking deltas remain on the streaming path only.
+
+Verification: unit tests lock both formats (Chat stream: no prefixed terminal chunk; Responses stream: `response.completed` synthesized; non-stream: `finish_reason=stop`, no `reasoning_content`). Local real-daemon probes and public-endpoint probes count frames exactly (`^data: [DONE]$` == 1, `data: data:` == 0 on all paths).
+
+Deployment: `kiri.13` and `kiri.14` both released via Actions and deployed to moecloud with sha256-verified binaries; smoke passed on the public endpoint (`sfo2.openkiri.zip`).
+
+Exit criterion: immersive-translate completes translation without a "failed" state on both stream and non-stream paths.
+
 ---
 
 # 9. Guardrails / Non-Goals
