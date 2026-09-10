@@ -727,6 +727,23 @@ Deployment: `kiri.13` and `kiri.14` both released via Actions and deployed to mo
 
 Exit criterion: immersive-translate completes translation without a "failed" state on both stream and non-stream paths.
 
+## Step 14 — Preserve client thinking tier across forked aliases (-low actually runs low)
+
+Follow-up triage: after Step 13 fixed the response shape, the client-reported `-low` model still executed `-high` upstream. Root cause of the long-running "fixed many times but never resolved" issue:
+
+- `thinking.ParseSuffix` only understands the parenthesized suffix form (`(low)`), so the client-facing dash form (`gemini-3.7-flash-low`) never sets `requestResult.HasSuffix`. Every prior suffix-preservation fix keyed on that flag, so `-low` requests silently resolved to the alias target's `-high` and the daemon ran high.
+- The 2026-09-07 compatibility stash (`619d83f2`) contained the alias fix (`preserveOAuthResolvedModelSuffix`), but the whole stash was never merged; Steps 13/14 recovered it in pieces, and the alias piece needed the dash-tier extension to actually work.
+
+Fix (`kiri.15`):
+
+- `preserveOAuthResolvedModelSuffix` now also detects the dash tier of the requested model (`dashThinkingTier`) and re-applies it to the alias target's family, producing `gemini-3.7-flash(low)` — which `resolveAntigravityModel` maps back to the daemon low variant.
+- Config-declared parenthesized suffixes still win (explicit upstream variant); a target already carrying the same dash tier is kept as-is; nofork route models (`[ant]gemini-3.7-flash-high`, `Fork: false`) are untouched (dash suffix is part of the name, not a tier intent).
+- Tests: forked `-low` alias preserves client suffix; no-suffix requests keep the alias target; existing suffix-preservation and nofork cooldown suites stay green.
+
+Verification: `sdk/cliproxy/auth` full suite + `-race` green; deployed to moecloud and verified on the public endpoint — a `gemini-3.7-flash-low` request now logs `model=gemini-3.7-flash(low)` in the TTFT line (authoritative executed variant), previously `gemini-3.7-flash-high`.
+
+Exit criterion: a `-low` request's TTFT log line shows the low variant, on both local and public endpoints.
+
 ---
 
 # 9. Guardrails / Non-Goals
