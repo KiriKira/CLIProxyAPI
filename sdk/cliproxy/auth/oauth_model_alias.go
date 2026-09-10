@@ -133,6 +133,62 @@ func preserveResolvedModelSuffix(resolved string, requestResult thinking.SuffixR
 	return resolved
 }
 
+func preserveOAuthResolvedModelSuffix(resolved string, requestResult thinking.SuffixResult) string {
+	resolved = strings.TrimSpace(resolved)
+	if resolved == "" {
+		return ""
+	}
+	// A config-declared parenthesized suffix is an explicit upstream
+	// variant and wins over any client suffix.
+	if thinking.ParseSuffix(resolved).HasSuffix {
+		return resolved
+	}
+	suffix := ""
+	if requestResult.HasSuffix && requestResult.RawSuffix != "" {
+		suffix = requestResult.RawSuffix
+	} else {
+		// ParseSuffix only understands the parenthesized suffix form; the
+		// client-facing dash form (gemini-3.7-flash-low) must be detected
+		// here too, otherwise the alias target's -high wins silently.
+		suffix = dashThinkingTier(requestResult.ModelName)
+	}
+	if suffix != "" {
+		// OAuth aliases may point at a default -high catalog entry. Preserve
+		// the client-requested thinking level instead of silently using high.
+		// If the resolved target already carries the same tier in canonical
+		// dash form, keep it as-is (the model name may be an exact catalog
+		// entry rather than a folded variant).
+		if rt := dashThinkingTier(resolved); rt != "" && rt == suffix {
+			return resolved
+		}
+		return stripVariantSuffix(resolved) + "(" + suffix + ")"
+	}
+	return resolved
+}
+
+// dashThinkingTier reports the -low/-medium/-high tier of a dash-suffixed
+// model name (OpenAI-style variant naming), or "" when absent.
+func dashThinkingTier(model string) string {
+	for _, t := range []string{"-high", "-medium", "-low"} {
+		if strings.HasSuffix(model, t) {
+			return strings.TrimPrefix(t, "-")
+		}
+	}
+	return ""
+}
+
+// stripVariantSuffix removes a trailing dash tier (-low/-medium/-high) or
+// parenthesized suffix from a model name, returning the bare family.
+func stripVariantSuffix(model string) string {
+	if tier := dashThinkingTier(model); tier != "" {
+		return strings.TrimSuffix(model, "-"+tier)
+	}
+	if base := thinking.ParseSuffix(model).ModelName; base != "" {
+		return base
+	}
+	return model
+}
+
 func oauthModelAliasForceMappingResponseModel(configAlias string) string {
 	return strings.TrimSpace(configAlias)
 }
@@ -229,7 +285,7 @@ func resolveModelAliasResultFromConfigModels(requestedModel string, models []mod
 					return OAuthModelAliasResult{}
 				}
 				return OAuthModelAliasResult{
-					UpstreamModel: preserveResolvedModelSuffix(original, requestResult),
+					UpstreamModel: preserveOAuthResolvedModelSuffix(original, requestResult),
 					ForceMapping:  models[i].GetForceMapping(),
 					OriginalAlias: oauthModelAliasForceMappingResponseModel(alias),
 				}
@@ -239,7 +295,7 @@ func resolveModelAliasResultFromConfigModels(requestedModel string, models []mod
 				originalAlias = oauthModelAliasForceMappingResponseModel(alias)
 			}
 			return OAuthModelAliasResult{
-				UpstreamModel: preserveResolvedModelSuffix(original, requestResult),
+				UpstreamModel: preserveOAuthResolvedModelSuffix(original, requestResult),
 				ForceMapping:  models[i].GetForceMapping(),
 				OriginalAlias: originalAlias,
 			}
@@ -358,7 +414,7 @@ func resolveUpstreamModelFromAliases(aliases []internalconfig.OAuthModelAlias, r
 					return OAuthModelAliasResult{}
 				}
 				return OAuthModelAliasResult{
-					UpstreamModel: preserveResolvedModelSuffix(original, requestResult),
+					UpstreamModel: preserveOAuthResolvedModelSuffix(original, requestResult),
 					ForceMapping:  entry.ForceMapping,
 					OriginalAlias: oauthModelAliasForceMappingResponseModel(alias),
 				}
@@ -368,7 +424,7 @@ func resolveUpstreamModelFromAliases(aliases []internalconfig.OAuthModelAlias, r
 				originalAlias = oauthModelAliasForceMappingResponseModel(alias)
 			}
 			return OAuthModelAliasResult{
-				UpstreamModel: preserveResolvedModelSuffix(original, requestResult),
+				UpstreamModel: preserveOAuthResolvedModelSuffix(original, requestResult),
 				ForceMapping:  entry.ForceMapping,
 				OriginalAlias: originalAlias,
 			}
@@ -426,20 +482,13 @@ func resolveUpstreamModelFromAliasTable(m *Manager, auth *Auth, requestedModel, 
 				return OAuthModelAliasResult{}
 			}
 			return OAuthModelAliasResult{
-				UpstreamModel: preserveResolvedModelSuffix(targetModel, requestResult),
+				UpstreamModel: preserveOAuthResolvedModelSuffix(targetModel, requestResult),
 				ForceMapping:  entry.forceMapping,
 				OriginalAlias: oauthModelAliasForceMappingResponseModel(entry.configAlias),
 			}
 		}
 
-		var upstreamModel string
-		if thinking.ParseSuffix(targetModel).HasSuffix {
-			upstreamModel = targetModel
-		} else if requestResult.HasSuffix && requestResult.RawSuffix != "" {
-			upstreamModel = targetModel + "(" + requestResult.RawSuffix + ")"
-		} else {
-			upstreamModel = targetModel
-		}
+		upstreamModel := preserveOAuthResolvedModelSuffix(targetModel, requestResult)
 
 		originalAlias := requestedModel
 		if entry.forceMapping {

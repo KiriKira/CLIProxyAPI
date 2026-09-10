@@ -385,3 +385,47 @@ func TestApplyOAuthModelAliasWithResult_NoForceMappingPreservesRequestedModelInO
 		t.Fatalf("OriginalAlias = %q want requested model when force-mapping off", res.OriginalAlias)
 	}
 }
+
+func TestApplyOAuthModelAlias_ForkedLowPreservesClientSuffix(t *testing.T) {
+	t.Parallel()
+	// Production shape: alias table maps -low onto a suffixed -high target
+	// with fork+force-mapping. The client-requested thinking level must be
+	// preserved (upstream runs low), not silently upgraded to the target's high.
+	mgr := NewManager(nil, nil, nil)
+	mgr.SetOAuthModelAlias(map[string][]internalconfig.OAuthModelAlias{
+		"antigravity": {{
+			Name:         "gemini-3.7-flash-high",
+			Alias:        "gemini-3.7-flash-low",
+			Fork:         true,
+			ForceMapping: true,
+		}},
+	})
+	auth := &Auth{ID: "forked-low", Provider: "antigravity"}
+	res := mgr.applyOAuthModelAliasWithResult(auth, "gemini-3.7-flash-low")
+	if res.UpstreamModel != "gemini-3.7-flash(low)" {
+		t.Fatalf("UpstreamModel = %q, want %q (client low must survive the -high alias target)", res.UpstreamModel, "gemini-3.7-flash(low)")
+	}
+	if !res.ForceMapping {
+		t.Fatal("expected ForceMapping true")
+	}
+}
+
+func TestApplyOAuthModelAlias_ForkedHighWithoutClientSuffixKeepsTarget(t *testing.T) {
+	t.Parallel()
+	// Regression: a request without a thinking suffix must keep the alias
+	// target unchanged (no suffix is invented).
+	mgr := NewManager(nil, nil, nil)
+	mgr.SetOAuthModelAlias(map[string][]internalconfig.OAuthModelAlias{
+		"antigravity": {{
+			Name:         "gemini-3.7-flash-high",
+			Alias:        "gemini-3.7-flash",
+			Fork:         true,
+			ForceMapping: true,
+		}},
+	})
+	auth := &Auth{ID: "forked-base", Provider: "antigravity"}
+	res := mgr.applyOAuthModelAliasWithResult(auth, "gemini-3.7-flash")
+	if res.UpstreamModel != "gemini-3.7-flash-high" {
+		t.Fatalf("UpstreamModel = %q, want %q", res.UpstreamModel, "gemini-3.7-flash-high")
+	}
+}
