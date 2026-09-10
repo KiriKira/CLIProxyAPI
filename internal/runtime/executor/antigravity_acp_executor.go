@@ -1819,7 +1819,6 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 
 	mu.Lock()
 	finalText := responseText.String()
-	finalThought := thoughtText.String()
 	mu.Unlock()
 
 	// Normalize the agent-native stop reason to the OpenAI-compatible value.
@@ -1831,6 +1830,12 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 		finishReason = "stop"
 	}
 
+	// The assistant message deliberately carries only the OpenAI-schema
+	// fields (role/content). The agent's thought transcript is NOT included:
+	// non-standard fields like `reasoning_content` make strict client-side
+	// response validators reject the whole completion (observed with
+	// immersive-translate). Thinking deltas remain available on the
+	// streaming path.
 	respPayload := map[string]interface{}{
 		"id":      fmt.Sprintf("chatcmpl-acp-%d", time.Now().UnixNano()),
 		"object":  "chat.completion",
@@ -1840,9 +1845,8 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 			{
 				"index": 0,
 				"message": map[string]interface{}{
-					"role":              "assistant",
-					"content":           finalText,
-					"reasoning_content": finalThought,
+					"role":    "assistant",
+					"content": finalText,
 				},
 				"finish_reason": finishReason,
 			},

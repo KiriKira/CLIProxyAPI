@@ -120,8 +120,7 @@ func TestAntigravityAcpExecutorExecute(t *testing.T) {
 	var data struct {
 		Choices []struct {
 			Message struct {
-				Content          string `json:"content"`
-				ReasoningContent string `json:"reasoning_content"`
+				Content string `json:"content"`
 			} `json:"message"`
 			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
@@ -138,8 +137,10 @@ func TestAntigravityAcpExecutorExecute(t *testing.T) {
 	if data.Choices[0].Message.Content != "hello from acp" {
 		t.Errorf("content = %q, want 'hello from acp'", data.Choices[0].Message.Content)
 	}
-	if data.Choices[0].Message.ReasoningContent != "thinking step" {
-		t.Errorf("reasoning_content = %q, want 'thinking step'", data.Choices[0].Message.ReasoningContent)
+	// The non-stream message must stay within the OpenAI schema: strict
+	// client validators reject non-standard fields such as reasoning_content.
+	if strings.Contains(string(resp.Payload), "reasoning_content") {
+		t.Errorf("non-stream response must not carry reasoning_content (strict clients reject non-standard fields)")
 	}
 	if data.Choices[0].FinishReason != "stop" {
 		t.Errorf("finish_reason = %q, want 'stop' (OpenAI-compatible normalization of the ACP end_turn)", data.Choices[0].FinishReason)
