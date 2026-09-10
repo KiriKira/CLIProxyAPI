@@ -1822,6 +1822,15 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 	finalThought := thoughtText.String()
 	mu.Unlock()
 
+	// Normalize the agent-native stop reason to the OpenAI-compatible value.
+	// Clients and the Responses translator expect `stop`; the ACP agent's
+	// `end_turn` is not part of the OpenAI schema and strict clients reject
+	// responses carrying it.
+	finishReason := stopReason
+	if finishReason == "" || finishReason == "end_turn" {
+		finishReason = "stop"
+	}
+
 	respPayload := map[string]interface{}{
 		"id":      fmt.Sprintf("chatcmpl-acp-%d", time.Now().UnixNano()),
 		"object":  "chat.completion",
@@ -1835,7 +1844,7 @@ func (e *AntigravityAcpExecutor) Execute(ctx context.Context, auth *cliproxyauth
 					"content":           finalText,
 					"reasoning_content": finalThought,
 				},
-				"finish_reason": stopReason,
+				"finish_reason": finishReason,
 			},
 		},
 	}
@@ -2165,7 +2174,15 @@ func (e *AntigravityAcpExecutor) ExecuteStream(ctx context.Context, auth *clipro
 			worker.AbandonSession(sessionID)
 		}
 
-		emitChunk([]byte("data: [DONE]\n\n"))
+		// Terminal marker is format-specific: the Responses translator needs
+		// a bare [DONE] to synthesize response.completed, while the Chat
+		// Completions outer writer appends its own `data: [DONE]` once the
+		// channel closes. Emitting the prefixed form here would double-wrap
+		// into `data: data: [DONE]` on the Chat path, which strict SSE
+		// parsers reject.
+		if responseFormat == sdktranslator.FormatOpenAIResponse {
+			emitChunk([]byte("[DONE]"))
+		}
 	}()
 
 	return result, nil

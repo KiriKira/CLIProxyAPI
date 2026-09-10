@@ -141,8 +141,8 @@ func TestAntigravityAcpExecutorExecute(t *testing.T) {
 	if data.Choices[0].Message.ReasoningContent != "thinking step" {
 		t.Errorf("reasoning_content = %q, want 'thinking step'", data.Choices[0].Message.ReasoningContent)
 	}
-	if data.Choices[0].FinishReason != "end_turn" {
-		t.Errorf("finish_reason = %q, want 'end_turn'", data.Choices[0].FinishReason)
+	if data.Choices[0].FinishReason != "stop" {
+		t.Errorf("finish_reason = %q, want 'stop' (OpenAI-compatible normalization of the ACP end_turn)", data.Choices[0].FinishReason)
 	}
 
 	assertHandshakeOrder(t, script)
@@ -203,10 +203,10 @@ func TestAntigravityAcpExecutorExecuteStream(t *testing.T) {
 		t.Fatalf("expected streamed chunks")
 	}
 
-	var hasThought, hasMessage, hasDone bool
+	var hasThought, hasMessage, hasPrefixedDone bool
 	for _, c := range receivedChunks {
 		if c == "data: [DONE]\n\n" {
-			hasDone = true
+			hasPrefixedDone = true
 		}
 		if len(c) > 0 {
 			var delta struct {
@@ -235,11 +235,57 @@ func TestAntigravityAcpExecutorExecuteStream(t *testing.T) {
 	if !hasMessage {
 		t.Errorf("missing expected message chunk in stream")
 	}
-	if !hasDone {
-		t.Errorf("missing [DONE] terminal chunk in stream")
+	// The Chat Completions outer writer appends its own `data: [DONE]` when
+	// the stream channel closes. The executor must NOT emit a prefixed
+	// terminal chunk here, or the client sees a `data: data: [DONE]` frame.
+	if hasPrefixedDone {
+		t.Errorf("executor must not emit a prefixed [DONE] chunk on the Chat Completions path (outer writer owns the terminal marker)")
 	}
 
 	assertHandshakeOrder(t, script)
+}
+
+// TestAntigravityAcpExecutorExecuteStreamResponsesTerminal verifies the
+// Responses path: the executor emits a bare [DONE] terminal marker which the
+// translator consumes to synthesize response.completed.
+func TestAntigravityAcpExecutorExecuteStreamResponsesTerminal(t *testing.T) {
+	script := createFakeAgentScript(t)
+	cfg := &internalconfig.Config{}
+	exec := NewAntigravityAcpExecutor(cfg)
+
+	auth := &cliproxyauth.Auth{
+		Attributes: map[string]string{
+			"binary_path": script,
+			"gemini_home": t.TempDir(),
+		},
+	}
+
+	req := cliproxyexecutor.Request{
+		Model:   "gemini-3.8-flash",
+		Payload: []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+	}
+	opts := cliproxyexecutor.Options{ResponseFormat: sdktranslator.FormatOpenAIResponse}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	stream, err := exec.ExecuteStream(ctx, auth, req, opts)
+	if err != nil {
+		t.Fatalf("ExecuteStream failed: %v", err)
+	}
+
+	var sawCompleted bool
+	for chunk := range stream.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error: %v", chunk.Err)
+		}
+		if strings.Contains(string(chunk.Payload), "response.completed") {
+			sawCompleted = true
+		}
+	}
+	if !sawCompleted {
+		t.Errorf("Responses streaming must synthesize response.completed from the bare [DONE] terminal marker")
+	}
 }
 
 func TestAntigravityAcpExecutorRejectsUnknownAuthMethod(t *testing.T) {
